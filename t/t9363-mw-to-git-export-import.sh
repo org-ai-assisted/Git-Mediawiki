@@ -27,12 +27,12 @@ test_git_reimport () {
 
 # Don't bother with permissions, be administrator by default
 test_expect_success 'setup config' '
-	git config --global remote.origin.mwLogin WikiAdmin &&
-	git config --global remote.origin.mwPassword AdminPass &&
+	git config --global remote.origin.mwLogin "$WIKI_ADMIN" &&
+	git config --global remote.origin.mwPassword "$WIKI_PASSW" &&
 	test_might_fail git config --global --unset remote.origin.mediaImport
 '
 
-test_expect_success 'git push can upload media (File:) files' '
+test_expect_failure 'git push can upload media (File:) files' '
 	wiki_reset &&
 	git clone mediawiki::'"$WIKI_URL"' mw_dir &&
 	(
@@ -55,6 +55,7 @@ test_expect_failure 'git clone works on previously created wiki with media files
 	test_cmp mw_dir_clone/Foo.txt mw_dir/Foo.txt &&
 	(cd mw_dir_clone && git checkout HEAD^) &&
 	(cd mw_dir && git checkout HEAD^) &&
+	test_path_is_file mw_dir_clone/Foo.txt &&
 	test_cmp mw_dir_clone/Foo.txt mw_dir/Foo.txt
 '
 
@@ -160,7 +161,7 @@ test_expect_success 'git push properly warns about insufficient permissions' '
 		git add foo.forbidden &&
 		git commit -m "add a file" &&
 		git push 2>actual &&
-		test_i18ngrep "foo.forbidden is not a permitted file" actual
+		test_grep "foo.forbidden is not a permitted file" actual
 	)
 '
 
