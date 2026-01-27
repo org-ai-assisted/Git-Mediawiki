@@ -8,7 +8,8 @@
 #
 ## Test git-remote-mediawiki
 
-all: test
+# The default target of this Makefile is...
+all:: test
 
 T = $(wildcard t[0-9][0-9][0-9][0-9]-*.sh)
 

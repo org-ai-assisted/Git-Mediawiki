@@ -12,6 +12,9 @@
 #
 #   make install
 
+# The default target of this Makefile is...
+all::
+
 GIT_MEDIAWIKI_PM=Git/Mediawiki.pm
 SCRIPT_PERL=git-remote-mediawiki
 SCRIPT_PERL+=git-mw
@@ -22,8 +25,9 @@ SCRIPT_PERL_FULL=$(patsubst %,$(shell pwd)/%,$(SCRIPT_PERL))
 INSTLIBDIR=$(PREFIX)/share/perl5/
 DESTDIR_SQ = $(subst ','\'',$(DESTDIR))
 INSTLIBDIR_SQ = $(subst ','\'',$(INSTLIBDIR))
+all:: build
 
-test:
+test: all
 	$(MAKE) -C t
 
 check: perlcritic test
