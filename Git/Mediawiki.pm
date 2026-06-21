@@ -52,8 +52,18 @@ sub smudge_filename {
 	my $filename = shift;
 	$filename =~ s{/}{@{[SLASH_REPLACEMENT]}}g;
 	$filename =~ s/ /_/g;
-	# Decode forbidden characters encoded in clean_filename
-	$filename =~ s/_%_([0-9a-fA-F][0-9a-fA-F])/sprintf('%c', hex($1))/ge;
+	# Decode forbidden characters encoded in clean_filename.
+	# SECURITY: only decode the exact characters clean_filename() encodes
+	# ([ ] { } |). An unrestricted hex decode let a crafted page title
+	# reintroduce path separators / dot segments (e.g. _%_2f -> '/',
+	# _%_2e -> '.') *after* the '/' -> '%2F' step above, yielding '../'
+	# path-traversal entries in the fast-import stream.
+	$filename =~ s/_%_([0-9a-fA-F][0-9a-fA-F])/
+		my $c = hex($1);
+		($c == 0x5b || $c == 0x5d || $c == 0x7b || $c == 0x7d || $c == 0x7c)
+			? chr($c) : "_%_$1"/ge;
+	# Defence in depth: never emit a path separator or control/NUL byte.
+	$filename =~ s{[/\x00-\x1f]}{_}g;
 	return substr($filename, 0, NAME_MAX-length('.mw'));
 }
 
@@ -75,6 +85,11 @@ sub connect_maybe {
 
 	$wiki->{ua}->agent("git-mediawiki/$Git::Mediawiki::VERSION " . $wiki->{ua}->agent());
 	$wiki->{ua}->conn_cache({total_capacity => undef});
+	# SECURITY: restrict the user agent to HTTP(S). Media downloads fetch a
+	# URL supplied by the wiki API (imageinfo.url) with no scheme check, so
+	# a malicious/compromised server could return file://, ftp://, etc. and
+	# trigger local-file read / SSRF. LWP only dispatches allowed schemes.
+	$wiki->{ua}->protocols_allowed([ 'http', 'https' ]);
 
 	$wiki->{config}->{api_url} = "${remote_url}/api.php";
 	if ($wiki_login) {
