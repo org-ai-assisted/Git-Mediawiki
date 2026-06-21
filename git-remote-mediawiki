@@ -780,6 +780,12 @@ sub import_file_revision {
 	my $author = $commit{author};
 	my $date = $commit{date};
 
+	# SECURITY (defence in depth): the wiki username is interpolated into the
+	# fast-import "committer" lines below. MediaWiki forbids these characters in
+	# usernames, but never trust the remote to enforce it -- a CR/LF would break
+	# the stream, '<'/'>' would corrupt the committer ident.
+	$author =~ s/[\r\n<>]/ /g;
+
 	print {*STDOUT} "commit refs/mediawiki/${remotename}/master\n";
 	print {*STDOUT} "mark :${n}\n";
 	print {*STDOUT} "committer ${author} <${author}\@${wiki_name}> " . $date->epoch . " +0000\n";
@@ -794,8 +800,14 @@ sub import_file_revision {
 			fe_escape_path("${title}.mw") . "\n";
 		literal_data($content);
 		if (%mediafile) {
+			# SECURITY: the media filename comes straight from the wiki and is
+			# NOT run through smudge_filename, so neutralise path separators and
+			# control bytes before using it as a fast-import path (no traversal
+			# / subdir injection). Mirrors the smudge_filename hardening.
+			my $media_path = $mediafile{title};
+			$media_path =~ s{[/\x00-\x1f]}{_}g;
 			print {*STDOUT} 'M 644 inline '
-				. fe_escape_path($mediafile{title}) . "\n";
+				. fe_escape_path($media_path) . "\n";
 			literal_data_raw($mediafile{content});
 		}
 		print {*STDOUT} "\n\n";
@@ -1274,6 +1286,17 @@ sub mw_push_revision {
 		foreach my $line (reverse @history) {
 			my @commit_info_split = split(/[ \n]/, $line);
 			push(@commit_pairs, \@commit_info_split);
+		}
+		# BUGFIX (data loss): the root commit has no parent, so its pages never
+		# appear in a (parent -> child) diff pair above and were silently
+		# dropped. Diff each root against the empty tree so its additions get
+		# pushed too. Processed first since the root is the oldest.
+		my $empty_tree = run_git_quoted(["hash-object", "-t", "tree", "/dev/null"]);
+		chomp($empty_tree);
+		my @roots = split(/\n/, run_git_quoted(["rev-list", "--max-parents=0", "--first-parent", $local]));
+		foreach my $root (reverse @roots) {
+			chomp($root);
+			unshift(@commit_pairs, [$empty_tree, $root]);
 		}
 	}
 
