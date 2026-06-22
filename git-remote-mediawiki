@@ -97,6 +97,35 @@ my $shallow_import = run_git_quoted(["config", "--get", "--bool", "remote.${remo
 chomp($shallow_import);
 $shallow_import = ($shallow_import eq 'true');
 
+# Mid-fetch checkpointing.
+#
+# git-mediawiki streams every imported revision to git-fast-import, but
+# fast-import only flushes its objects, the imported ref and the
+# mediawiki-revision notes to disk when the stream finalises. An import
+# interrupted before "done" (Ctrl-C, network drop, OOM, crash) therefore
+# loses ALL uncommitted progress: the next run reads get_last_local_revision(),
+# finds the note from the last *completed* fetch, and re-scans + re-imports
+# everything since then. On a big wiki this re-does hours of work.
+#
+# Emitting fast-import's "checkpoint" command after every N imported revisions
+# forces a flush of the pending objects, the refs/mediawiki/<remote>/master
+# ref and the refs/notes/<remote>/mediawiki notes ref. Because
+# get_last_local_revision() reads the note off the master tip, a checkpoint
+# makes the just-imported revisions durable and resumable: a later run picks up
+# right after the last checkpointed revision instead of from scratch.
+#
+# "checkpoint" is an async flush in fast-import -- it is safe to issue it after
+# the commit pair it should persist; fast-import completes the in-flight commit
+# before flushing.
+#
+# Configurable with remote.<remotename>.checkpointEvery (revisions per
+# checkpoint); 0 or negative disables checkpointing. Default 100.
+my $checkpoint_every = run_git_quoted(["config", "--get", "--int", "remote.${remotename}.checkpointEvery"]);
+chomp($checkpoint_every);
+if ($checkpoint_every eq q{}) {
+	$checkpoint_every = 100;
+}
+
 # Fetch (clone and pull) by revisions instead of by pages. This behavior
 # is more efficient when we have a wiki with lots of pages and we fetch
 # the revisions quite often so that they concern only few pages.
@@ -1024,6 +1053,15 @@ sub handle_result_page {
 		# Else do commit only for that page.
 		print {*STDERR} "${n}/", scalar(@{$revision_ids}), ": Revision #$rev->{revid} of $commit{title}\n";
 		import_file_revision(\%commit, ($fetch_from == 1), $n_actual, \%mediafile);
+
+		# Periodically flush partial progress so an interrupted fetch can
+		# resume after the last checkpointed revision (see $checkpoint_every).
+		# Issued AFTER import_file_revision so the just-written commit + note
+		# pair is part of what gets flushed.
+		if ($checkpoint_every > 0 && $n_actual % $checkpoint_every == 0) {
+			print {*STDERR} "Checkpointing fast-import after ${n_actual} revisions...\n";
+			print {*STDOUT} "checkpoint\n";
+		}
 	}
 
 	return $n_actual;
