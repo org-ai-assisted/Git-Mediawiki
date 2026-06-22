@@ -1146,10 +1146,20 @@ sub backfill_missing_mediafiles {
 		print {*STDOUT} "committer git-mediawiki <git-mediawiki\@${wiki_name}> " .
 			"${epoch} +0000\n";
 		literal_data("Backfill media for File:${filename}");
+		# Chain the backfill commits, mirroring import_file_revision's `from`:
+		#  - subsequent commits: `from :<prev mark>` (explicit chain).
+		#  - first commit, import committed this run ($start_mark > 0): OMIT
+		#    `from` so fast-import auto-chains to the import's in-stream tip. A
+		#    bare `from refs/.../master` is rejected ("branch from itself").
+		#  - first commit, nothing imported this run ($start_mark == 0): the
+		#    branch is untracked in-stream, so chain to the on-disk tip via `^0`
+		#    (exactly as import_file_revision does for its n==1 incremental case).
+		# Using `^0` on EVERY commit (the original bug) re-reads the stale
+		# on-disk value each time -> siblings, not a chain.
 		if (defined($prev_media_mark)) {
 			print {*STDOUT} "from :${prev_media_mark}\n";
-		} else {
-			print {*STDOUT} "from refs/mediawiki/${remotename}/master\n";
+		} elsif ($start_mark == 0) {
+			print {*STDOUT} "from refs/mediawiki/${remotename}/master^0\n";
 		}
 		print {*STDOUT} 'M 644 inline ' . fe_escape_path($media_path) . "\n";
 		literal_data_raw($mediafile{content});
@@ -1168,10 +1178,11 @@ sub backfill_missing_mediafiles {
 			print {*STDOUT} "committer git-mediawiki <git-mediawiki\@${wiki_name}> " .
 				"${epoch} +0000\n";
 			literal_data('Note carried forward by git-mediawiki media backfill');
+			# Same three-way chaining as the media commit above.
 			if (defined($prev_note_mark)) {
 				print {*STDOUT} "from :${prev_note_mark}\n";
-			} else {
-				print {*STDOUT} "from refs/notes/${remotename}/mediawiki\n";
+			} elsif ($start_mark == 0) {
+				print {*STDOUT} "from refs/notes/${remotename}/mediawiki^0\n";
 			}
 			print {*STDOUT} "N inline :${media_mark}\n";
 			literal_data("mediawiki_revision: ${last_local_rev}");
