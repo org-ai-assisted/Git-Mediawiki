@@ -1,7 +1,7 @@
 #! /usr/bin/perl
 
 # Copyright (C) 2011
-#     Jérémie Nikaes <jeremie.nikaes@ensimag.imag.fr>
+#     Jeremie Nikaes <jeremie.nikaes@ensimag.imag.fr>
 #     Arnaud Lacurie <arnaud.lacurie@ensimag.imag.fr>
 #     Claire Fousse <claire.fousse@ensimag.imag.fr>
 #     David Amouyal <david.amouyal@ensimag.imag.fr>
@@ -88,6 +88,34 @@ chomp(@tracked_namespaces);
 my $import_media = run_git_quoted(["config", "--get", "--bool", "remote.${remotename}.mediaimport"]);
 chomp($import_media);
 $import_media = ($import_media eq 'true');
+
+# Backfill File: media whose local binary is missing.
+#
+# Media is normally fetched only alongside a *new* File: page revision (see
+# handle_result_page -> get_mw_mediafile_for_page_revision). A clone that was
+# first taken with mediaimport=false imports the File: page text WITHOUT the
+# binary; a later incremental fetch with mediaimport=true sees no new revision
+# for those pages ("Found 0 revisions") and never backfills the binary. The
+# result is File: pages present in the tree with the actual image absent.
+#
+# When enabled, after the normal import we enumerate every File: page on the
+# wiki, check whether its binary is already present in the imported tree, and
+# fetch + commit the *current* version for any that are missing. This is
+# revision-agnostic on purpose: it keys off local-binary presence, not on
+# whether the page has a new revision, so it heals an old mediaimport=false
+# clone in place.
+#
+# Configurable with remote.<remotename>.backfillMedia (bool). Defaults to the
+# value of mediaimport: turning media import on implies we want every File:
+# page's binary, including ones a prior mediaimport=false run left behind.
+my $backfill_media_cfg = run_git_quoted(["config", "--get", "--bool", "remote.${remotename}.backfillMedia"]);
+chomp($backfill_media_cfg);
+my $backfill_media;
+if ($backfill_media_cfg eq q{}) {
+	$backfill_media = $import_media;
+} else {
+	$backfill_media = ($backfill_media_cfg eq 'true');
+}
 
 # Export media files on push
 my $export_media = run_git_quoted(["config", "--get", "--bool", "remote.${remotename}.mediaexport"]);
@@ -635,6 +663,39 @@ sub get_mw_mediafile_for_page_revision {
 	return %mediafile;
 }
 
+# Fetch the CURRENT (latest) version of a File: page's media, regardless of
+# any per-revision timestamp. Used by the media backfill, which heals a clone
+# whose binary is missing rather than tracking a specific historical revision.
+sub get_mw_current_mediafile {
+	# Name of the file on Wiki, without the File: prefix.
+	my $filename = shift;
+	my %mediafile;
+
+	my $query = {
+		action => 'query',
+		prop => 'imageinfo',
+		titles => "File:${filename}",
+		iiprop => 'timestamp|url',
+		iilimit => 1
+	};
+	my $result = $mediawiki->api($query);
+
+	my ($fileid, $file) = each( %{$result->{query}->{pages}} );
+	if (defined($file->{imageinfo})) {
+		my $fileinfo = pop(@{$file->{imageinfo}});
+		print {*STDERR} "\tBackfilling file $filename, version $fileinfo->{timestamp}\n";
+		my $content = download_mw_mediafile($fileinfo->{url});
+		if (defined($content)) {
+			$mediafile{content} = $content;
+			$mediafile{title} = $filename;
+			$mediafile{timestamp} = $fileinfo->{timestamp};
+		} else {
+			print {*STDERR} "\tFAILED downloading $fileinfo->{url}! Skipping!\n";
+		}
+	}
+	return %mediafile;
+}
+
 sub download_mw_mediafile {
 	my $download_url = shift;
 
@@ -935,12 +996,7 @@ sub import_file_revision {
 			fe_escape_path("${title}.mw") . "\n";
 		literal_data($content);
 		if (%mediafile) {
-			# SECURITY: the media filename comes straight from the wiki and is
-			# NOT run through smudge_filename, so neutralise path separators and
-			# control bytes before using it as a fast-import path (no traversal
-			# / subdir injection). Mirrors the smudge_filename hardening.
-			my $media_path = $mediafile{title};
-			$media_path =~ s{[/\x00-\x1f]}{_}g;
+			my $media_path = media_tree_path($mediafile{title});
 			print {*STDOUT} 'M 644 inline '
 				. fe_escape_path($media_path) . "\n";
 			literal_data_raw($mediafile{content});
@@ -964,6 +1020,127 @@ sub import_file_revision {
 	literal_data("mediawiki_revision: $commit{mw_revision}");
 	print {*STDOUT} "\n\n";
 	return;
+}
+
+# Map a wiki media filename (the part after "File:") to the path the binary is
+# stored at in the imported tree.
+#
+# SECURITY: the media filename comes straight from the wiki and is NOT run
+# through smudge_filename, so neutralise path separators and control bytes
+# before using it as a fast-import path (no traversal / subdir injection).
+# Mirrors the smudge_filename hardening. Both the import write path
+# (import_file_revision) and the backfill presence check MUST use this single
+# definition; if they diverged, the backfill would mis-detect presence and
+# either re-fetch forever or never heal.
+sub media_tree_path {
+	my $title = shift;
+	$title =~ s{[/\x00-\x1f]}{_}g;
+	return $title;
+}
+
+# Backfill File: media whose binary is absent from the imported tree.
+#
+# Runs after the normal import (when remote.<remote>.backfillMedia is on). It
+# enumerates every File: page on the wiki, checks whether the corresponding
+# binary already exists in refs/mediawiki/<remote>/master, and for each missing
+# one fetches + commits the *current* media version. This is what heals a clone
+# originally taken with mediaimport=false: those File: pages have no new
+# revision on an incremental fetch, so the per-revision media path never runs.
+#
+# $start_mark is the highest fast-import mark already used by this run; backfill
+# commits use marks above it. Returns the number of binaries committed.
+sub backfill_missing_mediafiles {
+	my $start_mark = shift;
+
+	$mediawiki = connect_maybe($mediawiki, $remotename, $url);
+
+	# Only meaningful once the ref exists (i.e. something has been imported).
+	my $tip = run_git_quoted_nostderr(
+		["rev-parse", "--verify", "--quiet",
+		 "refs/mediawiki/${remotename}/master"]);
+	chomp($tip);
+	if ($tip eq q{}) {
+		print {*STDERR} "Media backfill: no imported ref yet, nothing to backfill.\n";
+		return 0;
+	}
+
+	# Build the set of paths already present in the imported tree. The list is
+	# read once; checking ~1k File: pages against an in-memory hash avoids a
+	# git invocation per page.
+	my %present;
+	my $tree = run_git_quoted(
+		["ls-tree", "-r", "-z", "--name-only",
+		 "refs/mediawiki/${remotename}/master"], 'raw');
+	for my $path (split(/\0/, $tree)) {
+		$present{$path} = 1;
+	}
+
+	# Build the list of File: pages to consider, honouring the same tracked
+	# pages/categories/namespaces scope as a normal import (get_mw_pages),
+	# then keep only the File: namespace. This avoids pulling binaries for
+	# File: pages outside the user's tracked scope.
+	print {*STDERR} "Media backfill: listing File: pages on remote wiki...\n";
+	my $file_ns = get_mw_namespace_id('File');
+	my %pages = get_mw_pages();
+
+	# Determine which File: binaries are missing locally.
+	my @missing;
+	my $total_files = 0;
+	for my $title (keys %pages) {
+		my ($namespace, $filename) = $title =~ /^([^:]*):(.*)$/;
+		next if !defined($namespace) || !defined($filename) || $filename eq q{};
+		my $id = get_mw_namespace_id($namespace);
+		next if !defined($id) || $id != $file_ns;
+		$total_files++;
+		my $path = media_tree_path($filename);
+		push(@missing, $filename) if !$present{$path};
+	}
+
+	my $missing_count = scalar @missing;
+	print {*STDERR} "Media backfill: ${missing_count} of ${total_files} File: " .
+		"binaries missing locally.\n";
+	return 0 if $missing_count == 0;
+
+	# Fetch + commit each missing binary. One fast-import commit per binary,
+	# continuing from the current tip; no mediawiki-revision note is written
+	# (these are not new wiki revisions, only the missing blob).
+	my $mark = $start_mark;
+	my $committed = 0;
+	my $n = 0;
+	for my $filename (@missing) {
+		$n++;
+		print {*STDERR} "backfill ${n}/${missing_count}: File:${filename}\n";
+		my %mediafile = get_mw_current_mediafile($filename);
+		next if !%mediafile;
+
+		$mark++;
+		my $media_path = media_tree_path($mediafile{title});
+		my $epoch = 0;
+		if (defined($mediafile{timestamp})) {
+			$epoch = DateTime::Format::ISO8601
+				->parse_datetime($mediafile{timestamp})->epoch;
+		}
+		print {*STDOUT} "commit refs/mediawiki/${remotename}/master\n";
+		print {*STDOUT} "mark :${mark}\n";
+		print {*STDOUT} "committer git-mediawiki <git-mediawiki\@${wiki_name}> " .
+			"${epoch} +0000\n";
+		literal_data("Backfill media for File:${filename}");
+		print {*STDOUT} "from refs/mediawiki/${remotename}/master^0\n";
+		print {*STDOUT} 'M 644 inline ' . fe_escape_path($media_path) . "\n";
+		literal_data_raw($mediafile{content});
+		print {*STDOUT} "\n\n";
+		$committed++;
+
+		# Reuse the import checkpoint cadence so an interrupted backfill is
+		# resumable: a re-run re-detects only the still-missing binaries.
+		if ($checkpoint_every > 0 && $committed % $checkpoint_every == 0) {
+			print {*STDERR} "Checkpointing fast-import after ${committed} backfilled media...\n";
+			print {*STDOUT} "checkpoint\n";
+		}
+	}
+
+	print {*STDERR} "Media backfill: committed ${committed} binary file(s).\n";
+	return $committed;
 }
 
 # parse a sequence of
@@ -1033,6 +1210,14 @@ sub mw_import_ref {
 		print {*STDERR} qq(fatal: invalid fetch strategy "${fetch_strategy}".\n);
 		print {*STDERR} "Check your configuration variables remote.${remotename}.fetchStrategy and mediawiki.fetchStrategy\n";
 		exit 1;
+	}
+
+	# Heal File: pages whose binary is absent locally (e.g. clone first taken
+	# with mediaimport=false). These have no new revision so the per-revision
+	# media path above never fetches them. Backfill commits continue from the
+	# tip and reuse fast-import marks above the last import mark ($n).
+	if ($import_media && $backfill_media) {
+		$n += backfill_missing_mediafiles($n);
 	}
 
 	if ($fetch_from == 1 && $n == 0) {
