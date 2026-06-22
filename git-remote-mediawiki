@@ -1101,10 +1101,30 @@ sub backfill_missing_mediafiles {
 		"binaries missing locally.\n";
 	return 0 if $missing_count == 0;
 
+	# Incremental-fetch bookkeeping uses the mediawiki_revision note on the
+	# master TIP commit (get_last_local_revision reads
+	# `git notes show refs/mediawiki/<remote>/master`). A backfill commit
+	# advances that tip, so if it carried no note the next fetch would read an
+	# empty note, treat the clone as having no imported revision, and re-import
+	# the whole wiki from revision 1. Carry the current last-local revision
+	# forward as a note on every backfill commit so the tip always has it.
+	my $last_local_rev = get_last_local_revision();
+	print {*STDERR} "\n";
+
 	# Fetch + commit each missing binary. One fast-import commit per binary,
-	# continuing from the current tip; no mediawiki-revision note is written
-	# (these are not new wiki revisions, only the missing blob).
+	# chained LINEARLY off the current import tip, each carrying the last
+	# mediawiki_revision note forward (these are not new wiki revisions, only the
+	# missing blob). The chain must be explicit: the first commit descends from
+	# the existing master tip (bare ref, resolved via fast-import's in-stream
+	# branch state or the on-disk ref), and every subsequent commit descends from
+	# the previous backfill mark (`from :<prev>`). Using `^0` on every commit
+	# re-resolves the ref to its unchanged on-disk value each time, which makes
+	# the backfill commits SIBLINGS off one base rather than a chain, so only the
+	# last commit per checkpoint batch survives in the ref and the rest dangle.
+	# The note ref is chained the same way for the same reason.
 	my $mark = $start_mark;
+	my $prev_media_mark;
+	my $prev_note_mark;
 	my $committed = 0;
 	my $n = 0;
 	for my $filename (@missing) {
@@ -1114,6 +1134,7 @@ sub backfill_missing_mediafiles {
 		next if !%mediafile;
 
 		$mark++;
+		my $media_mark = $mark;
 		my $media_path = media_tree_path($mediafile{title});
 		my $epoch = 0;
 		if (defined($mediafile{timestamp})) {
@@ -1121,14 +1142,42 @@ sub backfill_missing_mediafiles {
 				->parse_datetime($mediafile{timestamp})->epoch;
 		}
 		print {*STDOUT} "commit refs/mediawiki/${remotename}/master\n";
-		print {*STDOUT} "mark :${mark}\n";
+		print {*STDOUT} "mark :${media_mark}\n";
 		print {*STDOUT} "committer git-mediawiki <git-mediawiki\@${wiki_name}> " .
 			"${epoch} +0000\n";
 		literal_data("Backfill media for File:${filename}");
-		print {*STDOUT} "from refs/mediawiki/${remotename}/master^0\n";
+		if (defined($prev_media_mark)) {
+			print {*STDOUT} "from :${prev_media_mark}\n";
+		} else {
+			print {*STDOUT} "from refs/mediawiki/${remotename}/master\n";
+		}
 		print {*STDOUT} 'M 644 inline ' . fe_escape_path($media_path) . "\n";
 		literal_data_raw($mediafile{content});
 		print {*STDOUT} "\n\n";
+		$prev_media_mark = $media_mark;
+
+		# Carry the mediawiki_revision note forward onto this new tip so
+		# get_last_local_revision() keeps returning the right value (see above).
+		# The note commits are chained too, otherwise the same sibling problem
+		# would drop every note but the last per checkpoint batch.
+		if ($last_local_rev > 0) {
+			$mark++;
+			my $note_mark = $mark;
+			print {*STDOUT} "commit refs/notes/${remotename}/mediawiki\n";
+			print {*STDOUT} "mark :${note_mark}\n";
+			print {*STDOUT} "committer git-mediawiki <git-mediawiki\@${wiki_name}> " .
+				"${epoch} +0000\n";
+			literal_data('Note carried forward by git-mediawiki media backfill');
+			if (defined($prev_note_mark)) {
+				print {*STDOUT} "from :${prev_note_mark}\n";
+			} else {
+				print {*STDOUT} "from refs/notes/${remotename}/mediawiki\n";
+			}
+			print {*STDOUT} "N inline :${media_mark}\n";
+			literal_data("mediawiki_revision: ${last_local_rev}");
+			print {*STDOUT} "\n\n";
+			$prev_note_mark = $note_mark;
+		}
 		$committed++;
 
 		# Reuse the import checkpoint cadence so an interrupted backfill is
