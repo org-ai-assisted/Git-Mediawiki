@@ -483,6 +483,15 @@ sub get_mw_first_pages {
 	}
 	while (my ($id, $page) = each(%{$mw_pages->{query}->{pages}})) {
 		if ($id < 0) {
+			# A File: page (ns 6) can exist as an uploaded binary with NO
+			# wikitext description page. The API then reports it "missing"
+			# (negative id), but the file is real and is synced via the
+			# mediaimport / backfill paths regardless of the description.
+			# Emitting "not found on wiki" for these is wrong and was pure
+			# spam on wikis with description-less files, so skip the warning
+			# for the File namespace (genuinely missing non-File pages still
+			# warn).
+			next if defined($page->{ns}) && $page->{ns} == 6;
 			print {*STDERR} "Warning: page $page->{title} not found on wiki\n";
 		} else {
 			$pages->{$page->{title}} = $page;
