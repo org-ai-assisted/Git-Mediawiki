@@ -83,6 +83,32 @@ sub connect_maybe {
 
 	$wiki = MediaWiki::API->new;
 
+	# Network-retry robustness for API calls.
+	#
+	# MediaWiki::API wraps every api()/list()/edit() call in its own retry +
+	# maxlag loop, but ships those OFF by default (retries=0, max_lag=undef): a
+	# single transient HTTP error (timeout, reset, 5xx) therefore aborts the
+	# whole fetch. Enable them, driven by remote.<remote>.maxRetries (retries
+	# after the first attempt; default 3, 0 disables). retry_delay seeds an
+	# escalating wait (the library also honours the server's reported lag via
+	# maxlag), so transient failures back off instead of killing the fetch.
+	# Permanent failures (auth/4xx, semantic API errors) are not retried by the
+	# library and still surface immediately.
+	my $max_retries = Git::config("remote.${remote_name}.maxRetries");
+	if (!defined($max_retries) || $max_retries eq '') {
+		$max_retries = 3;
+	}
+	$max_retries = int($max_retries);
+	$max_retries = 0 if $max_retries < 0;
+	$wiki->{config}->{retries} = $max_retries;
+	$wiki->{config}->{retry_delay} = 2;
+	# Ask the server to defer requests when its replication lag is high, and
+	# retry rather than error out when it is. 5s is the value the MediaWiki
+	# maxlag manual recommends.
+	$wiki->{config}->{max_lag} = 5;
+	$wiki->{config}->{max_lag_delay} = 5;
+	$wiki->{config}->{max_lag_retries} = $max_retries > 4 ? $max_retries : 4;
+
 	$wiki->{ua}->agent("git-mediawiki/$Git::Mediawiki::VERSION " . $wiki->{ua}->agent());
 	$wiki->{ua}->conn_cache({total_capacity => undef});
 	# SECURITY: restrict the user agent to HTTP(S). Media downloads fetch a

@@ -53,6 +53,16 @@ use constant SLICE_SIZE => 50;
 # the number of links to be returned (500 links max).
 use constant BATCH_SIZE => 10;
 
+# Network-retry backoff bounds (seconds). Transient failures are retried with
+# exponential backoff starting at RETRY_BACKOFF_BASE, doubling each attempt,
+# capped at RETRY_BACKOFF_MAX. See mw_retry() and remote.<remote>.maxRetries.
+use constant RETRY_BACKOFF_BASE => 1;
+use constant RETRY_BACKOFF_MAX => 30;
+
+# HTTP status codes that indicate a transient, retryable failure.
+use constant HTTP_CODE_REQUEST_TIMEOUT => 408;
+use constant HTTP_CODE_TOO_MANY_REQUESTS => 429;
+
 if (@ARGV != 2) {
 	exit_error_usage();
 }
@@ -124,6 +134,30 @@ my $checkpoint_every = run_git_quoted(["config", "--get", "--int", "remote.${rem
 chomp($checkpoint_every);
 if ($checkpoint_every eq q{}) {
 	$checkpoint_every = 100;
+}
+
+# Network-retry robustness.
+#
+# Transient network/API failures (connection timeout/reset, DNS blip, HTTP
+# 408/429/5xx, MediaWiki maxlag) must NOT kill a fetch: they are retried with
+# exponential backoff. Permanent failures (HTTP 400/401/403/404, auth, a
+# semantic API error) are NOT retried and fail loud immediately.
+#
+# Two network paths are hardened:
+#  - MediaWiki API calls ($mediawiki->api/list/edit) -- MediaWiki::API has a
+#    built-in retry+maxlag loop, enabled from this value in connect_maybe().
+#  - Media-file downloads (download_mw_mediafile) -- a raw LWP GET that bypasses
+#    MediaWiki::API; wrapped in our own mw_retry() exponential-backoff loop.
+#
+# Configurable with remote.<remotename>.maxRetries (retries *after* the first
+# attempt); 0 disables retrying. Default 3.
+my $max_retries = run_git_quoted(["config", "--get", "--int", "remote.${remotename}.maxRetries"]);
+chomp($max_retries);
+if ($max_retries eq q{}) {
+	$max_retries = 3;
+}
+if ($max_retries < 0) {
+	$max_retries = 0;
 }
 
 # Fetch (clone and pull) by revisions instead of by pages. This behavior
@@ -254,6 +288,62 @@ sub fatal_mw_error {
 	print STDERR "fatal: (error " . $mediawiki->{error}->{code} . ': ' .
 		$mediawiki->{error}->{details} . ")\n";
 	exit 1;
+}
+
+# Is this HTTP status code a transient (retryable) failure?
+# Retry on timeout (408), rate-limit (429) and any 5xx server error. Permanent
+# client errors (400/401/403/404, ...) and a 200 carrying a semantic API error
+# are NOT retried. Note LWP reports connection timeout / reset / DNS failure as
+# an internal 500 (e.g. "Can't connect ...", "read timeout"), so those network
+# blips fall under the 5xx case and are retried too; a bare 0 (no response
+# object) is treated as transient defensively.
+sub is_transient_http_code {
+	my $code = shift;
+	return 1 if !defined($code) || $code == 0;
+	return 1 if $code == HTTP_CODE_REQUEST_TIMEOUT;
+	return 1 if $code == HTTP_CODE_TOO_MANY_REQUESTS;
+	# 5xx server errors, and LWP's internal 5xx codes used when no HTTP response
+	# arrived (connection refused / reset / timeout / DNS failure).
+	return 1 if $code >= 500 && $code <= 599;
+	return 0;
+}
+
+# Run a network operation with exponential-backoff retry on transient failure.
+#
+#   mw_retry($what, $is_transient, $attempt) where:
+#     $what         - short human description for messages (e.g. "download foo")
+#     $is_transient - coderef: given the result of $attempt, return true if the
+#                     failure is transient and should be retried, false/empty if
+#                     it succeeded or failed permanently.
+#     $attempt      - coderef performing one try; its return value is passed to
+#                     $is_transient and, on success, returned by mw_retry.
+#
+# Retries up to $max_retries times with backoff 1s, 2s, 4s ... capped at
+# RETRY_BACKOFF_MAX. After exhausting retries on a still-transient failure it
+# returns the last result (the caller then fails loud); it never silently skips.
+sub mw_retry {
+	my ($what, $is_transient, $attempt) = @_;
+	my $result;
+	my $backoff = RETRY_BACKOFF_BASE;
+	for (my $try = 0; ; $try++) {
+		$result = $attempt->();
+		# Success or permanent failure: hand back to the caller immediately.
+		if (!$is_transient->($result)) {
+			return $result;
+		}
+		# Transient failure: stop once we have used up our retry budget.
+		if ($try >= $max_retries) {
+			print {*STDERR} "Retried to $what $max_retries time(s); giving up.\n";
+			return $result;
+		}
+		print {*STDERR} "Transient failure to $what; retrying in ${backoff}s " .
+			'(attempt ' . ($try + 2) . ' of ' . ($max_retries + 1) . ").\n";
+		sleep $backoff;
+		$backoff *= 2;
+		if ($backoff > RETRY_BACKOFF_MAX) {
+			$backoff = RETRY_BACKOFF_MAX;
+		}
+	}
 }
 
 ## Functions for listing pages on the remote wiki
@@ -548,7 +638,15 @@ sub get_mw_mediafile_for_page_revision {
 sub download_mw_mediafile {
 	my $download_url = shift;
 
-	my $response = $mediawiki->{ua}->get($download_url);
+	# This GET goes straight through LWP and bypasses MediaWiki::API's retry
+	# loop, so harden it ourselves: retry transient failures (timeout, reset,
+	# 408/429/5xx) with exponential backoff. Permanent failures (404/403/...)
+	# fall through without retrying.
+	my $response = mw_retry(
+		"download mediafile $download_url",
+		sub { my $r = shift; return is_transient_http_code($r->code); },
+		sub { return $mediawiki->{ua}->get($download_url); },
+	);
 	if ($response->code == HTTP_CODE_OK) {
 		# It is tempting to return
 		# $response->decoded_content({charset => "none"}), but
@@ -563,9 +661,17 @@ sub download_mw_mediafile {
 		$download_url =~ s{.*?\Q$wiki_name\E/}{$url/};
 		return download_mw_mediafile($download_url);
 	} else {
+		# Transient retries (if any) are already exhausted here. Fail loud:
+		# a still-failing transient code (timeout/5xx) must abort the fetch
+		# rather than silently dropping the media file. Permanent codes
+		# (404/403/...) are reported the same way by the caller.
 		print {*STDERR} "Error downloading mediafile from :\n";
 		print {*STDERR} "URL: ${download_url}\n";
 		print {*STDERR} 'Server response: ' . $response->code . q{ } . $response->message . "\n";
+		if (is_transient_http_code($response->code)) {
+			die "fatal: persistent transient error downloading $download_url " .
+				'(HTTP ' . $response->code . q{ } . $response->message . ")\n";
+		}
 		return;
 	}
 }
