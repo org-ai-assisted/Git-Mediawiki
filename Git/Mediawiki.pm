@@ -7,6 +7,7 @@ use Git;
 
 use strict;
 use warnings;
+use Encode qw(encode_utf8 decode_utf8);
 
 BEGIN {
 
@@ -65,19 +66,24 @@ sub smudge_filename {
 	# Defence in depth: never emit a path separator or control/NUL byte.
 	$filename =~ s{[/\x00-\x1f]}{_}g;
 	# Keep room for the '.mw' suffix appended by the caller. NAME_MAX is a BYTE
-	# limit, so truncate by bytes -- but a byte-wise cut of a near-limit title
-	# can split a multi-byte UTF-8 character, yielding an invalid filename. After
-	# truncating, drop any trailing INCOMPLETE UTF-8 sequence (a lead byte with
-	# fewer continuation bytes than it needs); complete sequences are untouched.
-	# (Local fork change -- robustness, non-security; cf. security finding 01.)
+	# budget, but $filename is a decoded CHARACTER string (MediaWiki::API
+	# JSON-decodes API responses), so measure and cut in the BYTE domain: encode
+	# to UTF-8, truncate at the budget, drop any trailing INCOMPLETE multi-byte
+	# sequence the cut left (complete characters untouched), then decode back.
+	# Truncating the character string instead would both miss over-budget
+	# multi-byte titles (length() counts characters, not bytes) and corrupt a
+	# valid trailing character whose code point lands in 0xC2-0xF4. (Local fork
+	# change -- robustness, non-security; cf. security finding 01.)
 	my $max = NAME_MAX - length('.mw');
-	if (length($filename) > $max) {
-		$filename = substr($filename, 0, $max);
-		$filename =~ s/
+	my $bytes = encode_utf8($filename);
+	if (length($bytes) > $max) {
+		$bytes = substr($bytes, 0, $max);
+		$bytes =~ s/
 			(?: [\xC2-\xDF]                  # 2-byte lead, 0 continuations
 			  | [\xE0-\xEF] [\x80-\xBF]?     # 3-byte lead, <2 continuations
 			  | [\xF0-\xF4] [\x80-\xBF]{0,2} # 4-byte lead, <3 continuations
 			) \z//x;
+		$filename = decode_utf8($bytes);
 	}
 	return $filename;
 }

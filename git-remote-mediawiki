@@ -614,6 +614,7 @@ sub get_linked_mediafiles {
 			pllimit => 'max',
 			imlimit => 'max',
 		};
+		my $rounds = 0;
 		while (1) {
 			my $result = $mediawiki->api($query);
 
@@ -638,6 +639,13 @@ sub get_linked_mediafiles {
 					$query = { %{$query}, %{$qc->{$mod}} };
 				}
 			} else {
+				last;
+			}
+			# Backstop a server returning a non-advancing continuation cursor
+			# (which would otherwise loop forever): a real page exhausts in a
+			# handful of rounds even at bot link limits. (Local fork change.)
+			if (++$rounds >= 1000) {
+				print {*STDERR} "Warning: get_linked_mediafiles continuation did not terminate after ${rounds} rounds; stopping to avoid a stuck cursor.\n";
 				last;
 			}
 		}
@@ -802,13 +810,14 @@ sub get_last_global_remote_rev {
 sub get_last_remote_revision {
 	$mediawiki = connect_maybe($mediawiki, $remotename, $url);
 
-	# Full-wiki mirror (no tracked page/category subset): the last revision
-	# "concerning the tracked pages" is just the wiki's global last revision, so
-	# one recentchanges query answers it -- instead of one API round-trip PER
-	# page (thousands of serial calls before any push work begins on a large
-	# wiki). Only the per-page scan below can answer a tracked SUBSET correctly,
-	# so keep it for that case. (Local fork change.)
-	if (!@tracked_pages && !@tracked_categories) {
+	# Full-wiki mirror (no tracked page/category/namespace subset): the last
+	# revision "concerning the tracked pages" is just the wiki's global last
+	# revision, so one recentchanges query answers it -- instead of one API
+	# round-trip PER page (thousands of serial calls before any push work begins
+	# on a large wiki). The three conditions mirror get_mw_pages's $user_defined
+	# exactly; only the per-page scan below can answer a tracked SUBSET (incl. a
+	# namespace-restricted clone) correctly, so keep it for that. (Local fork change.)
+	if (!@tracked_pages && !@tracked_categories && !@tracked_namespaces) {
 		return get_last_global_remote_rev();
 	}
 
@@ -1761,7 +1770,12 @@ sub mw_push_revision {
 				foreach my $parent (split(/ /, $parents)) {
 					$local_ancestry{$parent} = $child;
 				}
-			} elsif ($line !~ /^[a-f0-9]+/) {
+			} elsif ($line !~ /^-?[a-f0-9]+/) {
+				# Accept the leading '-' of a `--boundary` commit: when that
+				# boundary commit is a ROOT (no parents) the first regex above
+				# does not match, and the boundary line is just '-<sha>' with no
+				# parents to record -- not malformed output. Only a line that is
+				# not even an (optionally dash-prefixed) sha is unexpected.
 				die "Unexpected output from git rev-list: ${line}\n";
 			}
 		}
