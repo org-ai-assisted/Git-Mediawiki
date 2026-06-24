@@ -273,14 +273,12 @@ sub is_valid_remote {
 	my @remotes = git_cmd_try {
 		Git::command('remote') }
 		"%s failed w/ code %d";
-	my $found_remote = 0;
-	foreach my $remote (@remotes) {
-		if ($remote eq $remote) {
-			$found_remote = 1;
-			last;
-		}
-	}
-	return $found_remote;
+	# The original loop reused 'my $remote' as the loop variable, shadowing the
+	# parameter, so 'if ($remote eq $remote)' compared the loop element to
+	# itself -- always true -- and is_valid_remote() returned true for ANY name
+	# as long as one remote existed. Compare each remote to the argument.
+	# (Local fork change.)
+	return scalar grep { $_ eq $remote } @remotes;
 }
 
 sub find_mediawiki_remotes {

@@ -600,31 +600,45 @@ sub get_linked_mediafiles {
 		# pattern 'page1|page2|...' required by the API
 		my $mw_titles = join('|', @slice);
 
-		# Media files could be included or linked from
-		# a page, get all related
+		# Media files could be included or linked from a page; get all related.
+		# A page's links/images lists can exceed one API response, so follow the
+		# continuation cursor: a single api() call (unlike ->list()) does NOT
+		# auto-continue, and imlimit was never set -- so without this, linked
+		# media on heavily-linked pages was silently dropped. Handle the modern
+		# 'continue' and legacy 'query-continue' forms. (Local fork change.)
 		my $query = {
 			action => 'query',
 			prop => 'links|images',
 			titles => $mw_titles,
 			plnamespace => get_mw_namespace_id('File'),
-			pllimit => 'max'
+			pllimit => 'max',
+			imlimit => 'max',
 		};
-		my $result = $mediawiki->api($query);
+		while (1) {
+			my $result = $mediawiki->api($query);
 
-		while (my ($id, $page) = each(%{$result->{query}->{pages}})) {
-			my @media_titles;
-			if (defined($page->{links})) {
-				my @link_titles
-					= map { $_->{title} } @{$page->{links}};
-				push(@media_titles, @link_titles);
+			while (my ($id, $page) = each(%{$result->{query}->{pages}})) {
+				my @media_titles;
+				if (defined($page->{links})) {
+					push(@media_titles, map { $_->{title} } @{$page->{links}});
+				}
+				if (defined($page->{images})) {
+					push(@media_titles, map { $_->{title} } @{$page->{images}});
+				}
+				if (@media_titles) {
+					get_mw_page_list(\@media_titles, $pages);
+				}
 			}
-			if (defined($page->{images})) {
-				my @image_titles
-					= map { $_->{title} } @{$page->{images}};
-				push(@media_titles, @image_titles);
-			}
-			if (@media_titles) {
-				get_mw_page_list(\@media_titles, $pages);
+
+			if ($result->{continue}) {
+				$query = { %{$query}, %{$result->{continue}} };
+			} elsif ($result->{'query-continue'}) {
+				my $qc = $result->{'query-continue'};
+				foreach my $mod (keys %{$qc}) {
+					$query = { %{$query}, %{$qc->{$mod}} };
+				}
+			} else {
+				last;
 			}
 		}
 
@@ -787,6 +801,16 @@ sub get_last_global_remote_rev {
 # categories.
 sub get_last_remote_revision {
 	$mediawiki = connect_maybe($mediawiki, $remotename, $url);
+
+	# Full-wiki mirror (no tracked page/category subset): the last revision
+	# "concerning the tracked pages" is just the wiki's global last revision, so
+	# one recentchanges query answers it -- instead of one API round-trip PER
+	# page (thousands of serial calls before any push work begins on a large
+	# wiki). Only the per-page scan below can answer a tracked SUBSET correctly,
+	# so keep it for that case. (Local fork change.)
+	if (!@tracked_pages && !@tracked_categories) {
+		return get_last_global_remote_rev();
+	}
 
 	my %pages_hash = get_mw_pages();
 	my @pages = values(%pages_hash);
@@ -954,7 +978,11 @@ sub fetch_mw_revisions {
 		print {*STDERR} "page ${n}/", scalar(@pages), ': ', $page->{title}, "\n";
 		$n++;
 		my @page_revs = fetch_mw_revisions_for_page($page, $id, $fetch_from);
-		@revisions = (@page_revs, @revisions);
+		# push() rather than prepend (@page_revs, @revisions): the prepend
+		# rebuilt and recopied the whole growing list per page -- O(pages^2),
+		# ~10^8 copies on a 10k-page clone. The caller sorts @revisions by revid
+		# afterwards, so accumulation order does not matter. (Local fork change.)
+		push(@revisions, @page_revs);
 	}
 
 	return ($n, @revisions);
@@ -1733,7 +1761,7 @@ sub mw_push_revision {
 				foreach my $parent (split(/ /, $parents)) {
 					$local_ancestry{$parent} = $child;
 				}
-			} elsif (!$line =~ /^([a-f0-9]+)/) {
+			} elsif ($line !~ /^[a-f0-9]+/) {
 				die "Unexpected output from git rev-list: ${line}\n";
 			}
 		}

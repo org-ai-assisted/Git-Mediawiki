@@ -64,7 +64,22 @@ sub smudge_filename {
 			? chr($c) : "_%_$1"/ge;
 	# Defence in depth: never emit a path separator or control/NUL byte.
 	$filename =~ s{[/\x00-\x1f]}{_}g;
-	return substr($filename, 0, NAME_MAX-length('.mw'));
+	# Keep room for the '.mw' suffix appended by the caller. NAME_MAX is a BYTE
+	# limit, so truncate by bytes -- but a byte-wise cut of a near-limit title
+	# can split a multi-byte UTF-8 character, yielding an invalid filename. After
+	# truncating, drop any trailing INCOMPLETE UTF-8 sequence (a lead byte with
+	# fewer continuation bytes than it needs); complete sequences are untouched.
+	# (Local fork change -- robustness, non-security; cf. security finding 01.)
+	my $max = NAME_MAX - length('.mw');
+	if (length($filename) > $max) {
+		$filename = substr($filename, 0, $max);
+		$filename =~ s/
+			(?: [\xC2-\xDF]                  # 2-byte lead, 0 continuations
+			  | [\xE0-\xEF] [\x80-\xBF]?     # 3-byte lead, <2 continuations
+			  | [\xF0-\xF4] [\x80-\xBF]{0,2} # 4-byte lead, <3 continuations
+			) \z//x;
+	}
+	return $filename;
 }
 
 sub connect_maybe {
