@@ -730,12 +730,18 @@ sub get_mw_current_mediafile {
 sub download_mw_mediafile {
 	my $download_url = shift;
 
+	# The media URL can legitimately carry credentials in its userinfo (see the
+	# "user:password@" fallback below), so NEVER log it raw -- redact the
+	# userinfo for any progress / error / fatal message. (Local fork change.)
+	my $display_url = $download_url;
+	$display_url =~ s{^([^:/?#]+://)[^/@]*@}{${1}<redacted>@};
+
 	# This GET goes straight through LWP and bypasses MediaWiki::API's retry
 	# loop, so harden it ourselves: retry transient failures (timeout, reset,
 	# 408/429/5xx) with exponential backoff. Permanent failures (404/403/...)
 	# fall through without retrying.
 	my $response = mw_retry(
-		"download mediafile $download_url",
+		"download mediafile $display_url",
 		sub { my $r = shift; return is_transient_http_code($r->code); },
 		sub { return $mediawiki->{ua}->get($download_url); },
 	);
@@ -758,10 +764,10 @@ sub download_mw_mediafile {
 		# rather than silently dropping the media file. Permanent codes
 		# (404/403/...) are reported the same way by the caller.
 		print {*STDERR} "Error downloading mediafile from :\n";
-		print {*STDERR} "URL: ${download_url}\n";
+		print {*STDERR} "URL: ${display_url}\n";
 		print {*STDERR} 'Server response: ' . $response->code . q{ } . $response->message . "\n";
 		if (is_transient_http_code($response->code)) {
-			die "fatal: persistent transient error downloading $download_url " .
+			die "fatal: persistent transient error downloading $display_url " .
 				'(HTTP ' . $response->code . q{ } . $response->message . ")\n";
 		}
 		return;
@@ -1154,6 +1160,17 @@ sub backfill_missing_mediafiles {
 	# empty note, treat the clone as having no imported revision, and re-import
 	# the whole wiki from revision 1. Carry the current last-local revision
 	# forward as a note on every backfill commit so the tip always has it.
+	#
+	# KNOWN LIMITATION: get_last_local_revision() reads the note off the on-disk
+	# ref, which fast-import only flushes at a `checkpoint` or `done`. Backfill
+	# runs in the same stream BEFORE `done`, so this can be up to
+	# remote.<remote>.checkpointEvery revisions behind the latest just-imported
+	# revision -- the carried note (and thus the next incremental fetch's start
+	# point) may be that stale, causing the next fetch to RE-IMPORT those
+	# revisions. That re-import is idempotent (no corruption, no data loss; a
+	# re-edit to identical text is a MediaWiki no-op) and is moot for a one-shot
+	# clone/restore, so it is left as-is; a full fix would thread the max revid
+	# imported this run down from mw_import instead of re-reading the note.
 	my $last_local_rev = get_last_local_revision();
 	print {*STDERR} "\n";
 
@@ -1510,17 +1527,24 @@ sub is_auth_transient {
 sub mw_api_edit_retry {
 	my ($query, $opts, $what) = @_;
 	my $attempt = 0;
+	my $backoff = RETRY_BACKOFF_BASE;
 	while (1) {
 		my $result = $opts ? $mediawiki->edit($query, $opts)
 				   : $mediawiki->edit($query);
 		return $result if $result;
 		my $err_details = $mediawiki->{error}->{details} || q{};
-		if (!($attempt < 8 && is_transient_api_error($err_details))) {
+		# Honour remote.<remote>.maxRetries (default 3, 0 disables) -- the same
+		# budget the fetch path uses -- instead of a hard-coded count, so a
+		# no-retry configuration is respected on the push side too.
+		if (!($attempt < $max_retries && is_transient_api_error($err_details))) {
 			return;
 		}
 		$attempt++;
 		print {*STDERR} "Transient error ${what} (attempt ${attempt}): ${err_details}; retrying...\n";
-		sleep($attempt);
+		# Exponential backoff capped at RETRY_BACKOFF_MAX, matching mw_retry.
+		sleep($backoff);
+		$backoff *= 2;
+		$backoff = RETRY_BACKOFF_MAX if $backoff > RETRY_BACKOFF_MAX;
 		if (is_auth_transient($err_details)) {
 			$mediawiki = connect_maybe(undef, $remotename, $url);
 		} else {

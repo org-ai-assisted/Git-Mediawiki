@@ -63,8 +63,9 @@ sub smudge_filename {
 		my $c = hex($1);
 		($c == 0x5b || $c == 0x5d || $c == 0x7b || $c == 0x7d || $c == 0x7c)
 			? chr($c) : "_%_$1"/ge;
-	# Defence in depth: never emit a path separator or control/NUL byte.
-	$filename =~ s{[/\x00-\x1f]}{_}g;
+	# Defence in depth: never emit a path separator or control byte -- the C0
+	# range \x00-\x1f AND DEL \x7f.
+	$filename =~ s{[/\x00-\x1f\x7f]}{_}g;
 	# Keep room for the '.mw' suffix appended by the caller. NAME_MAX is a BYTE
 	# budget, but $filename is a decoded CHARACTER string (MediaWiki::API
 	# JSON-decodes API responses), so measure and cut in the BYTE domain: encode
@@ -128,7 +129,11 @@ sub connect_maybe {
 	# maxlag manual recommends.
 	$wiki->{config}->{max_lag} = 5;
 	$wiki->{config}->{max_lag_delay} = 5;
-	$wiki->{config}->{max_lag_retries} = $max_retries > 4 ? $max_retries : 4;
+	# Floor maxlag retries at 4 (replica lag is common and deserves more
+	# patience than a generic transient) -- but honour an explicit 0: when the
+	# user disables retries (maxRetries=0) do not silently retry maxlag either.
+	$wiki->{config}->{max_lag_retries} =
+		$max_retries == 0 ? 0 : ($max_retries > 4 ? $max_retries : 4);
 
 	$wiki->{ua}->agent("git-mediawiki/$Git::Mediawiki::VERSION " . $wiki->{ua}->agent());
 	$wiki->{ua}->conn_cache({total_capacity => undef});

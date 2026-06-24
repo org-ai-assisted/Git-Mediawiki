@@ -21,10 +21,10 @@ use FindBin;
 use lib "$FindBin::Bin/..";
 use Test::More tests => 14;
 use Encode qw(encode_utf8 decode_utf8);
+use POSIX qw(NAME_MAX);                # the same byte budget smudge_filename uses
 use Git::Mediawiki qw(clean_filename smudge_filename);
 
-use constant NAME_MAX => 255;          # Linux filesystem byte limit
-use constant BUDGET   => NAME_MAX - length('.mw');
+use constant BUDGET => NAME_MAX - length('.mw');
 
 sub blen { return length(encode_utf8($_[0])); }   # byte length of a char string
 

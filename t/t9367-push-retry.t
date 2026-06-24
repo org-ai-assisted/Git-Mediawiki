@@ -4,37 +4,45 @@
 # classifiers, shared by page edits and media uploads).
 #
 # Like t9366-network-retry.t this does NOT touch a live wiki: it extracts the
-# REAL subs verbatim from the shipped git-remote-mediawiki and exercises them
-# with mocks, proving:
+# REAL subs AND the backoff constants verbatim from the shipped
+# git-remote-mediawiki and exercises them with mocks, proving:
 #   * the classifier correctly separates transient server errors (DBQueryError,
 #     deadlock, ratelimited, maxlag, readonly, 5xx, badtoken, assert*failed)
 #     from errors that must NOT be retried (permissiondenied, protectedpage,
-#     sitecssprotected, a real edit conflict),
-#   * a transient edit failure is retried with escalating backoff and recovers,
+#     sitecssprotected, a real edit conflict) -- positive AND negative on both axes,
+#   * a transient edit failure is retried with capped exponential backoff and
+#     recovers,
 #   * an AUTH-class transient (badtoken) rebuilds the API handle via
 #     connect_maybe(undef,...) -- the B1 fix: a warm reconnect would NOT refresh
 #     a stale CSRF token, only a fresh login does,
 #   * a non-transient failure returns undef immediately (so mw_push_file can
 #     classify it as skip / conflict / fatal) with no retry,
-#   * an unrecoverable transient exhausts the 8-attempt budget and returns undef
-#     (the caller then reports non-fast-forward, never a silent success).
+#   * the retry budget honours remote.<remote>.maxRetries (settable here), and an
+#     unrecoverable transient exhausts it and returns undef (never a silent
+#     success).
 
 use strict;
 use warnings;
 use FindBin;
-use Test::More tests => 22;
+use Test::More tests => 31;
 
 # sleep -> no-op that RECORDS its argument, so the test runs instantly yet can
 # assert the backoff schedule. Installed before the helper source is compiled.
 our @sleeps;
 BEGIN { *CORE::GLOBAL::sleep = sub { push @sleeps, $_[0]; return; }; }
 
-# ---- load the real subs from the shipped helper ---------------------------
+# ---- load the real subs + constants from the shipped helper ---------------
 my $helper = "$FindBin::Bin/../git-remote-mediawiki";
 open(my $fh, '<', $helper) or die "cannot open $helper: $!";
 my $src = do { local $/; <$fh> };
 close($fh);
 
+my %const_src;
+for my $name (qw(RETRY_BACKOFF_BASE RETRY_BACKOFF_MAX)) {
+	$src =~ /^use constant \Q$name\E => .*?;$/m
+		or die "could not extract constant $name from $helper";
+	$const_src{$name} = $&;
+}
 my %subs;
 for my $name (qw(is_transient_api_error is_auth_transient mw_api_edit_retry)) {
 	$src =~ /^sub \Q$name\E \{.*?^\}/ms
@@ -42,16 +50,17 @@ for my $name (qw(is_transient_api_error is_auth_transient mw_api_edit_retry)) {
 	$subs{$name} = $&;
 }
 
-# A controllable connect_maybe mock: records whether each (re)connect was a
-# 'warm' reuse (handle passed) or a 'fresh' rebuild (undef passed -> re-login).
-# On a fresh rebuild it installs the next queued handle, so the test can make
-# the post-relogin edit succeed.
+# Controllable connect_maybe mock: records 'warm' (handle passed) vs 'fresh'
+# (undef passed -> re-login); on a fresh rebuild it installs the next queued
+# handle so the post-relogin edit can succeed.
 our @reconnects;
 our @fresh_handles;
 my $sandbox = join("\n",
 	'package PushRetry;',
 	'use strict; use warnings;',
-	'our ($mediawiki, $remotename, $url);',
+	$const_src{RETRY_BACKOFF_BASE},
+	$const_src{RETRY_BACKOFF_MAX},
+	'our ($mediawiki, $remotename, $url, $max_retries);',
 	'sub connect_maybe {',
 	'    my ($handle, $rn, $u) = @_;',
 	'    push @main::reconnects, (defined($handle) ? q{warm} : q{fresh});',
@@ -66,6 +75,8 @@ my $sandbox = join("\n",
 eval $sandbox;  ## no critic
 die "sandbox compile failed: $@" if $@;
 
+sub set_max_retries { no strict 'refs'; ${'PushRetry::max_retries'} = shift; return; }
+
 # Silence the helper's STDERR chatter.
 sub quiet (&) {
 	my $code = shift;
@@ -76,9 +87,9 @@ sub quiet (&) {
 	return wantarray ? @r : $r[0];
 }
 
-# A fake MediaWiki::API handle: ->edit() pops the next scripted outcome. An
-# outcome that is a hashref with {ok} succeeds (and is returned); otherwise it
-# sets {error}{code,details} and returns false, exactly like the real client.
+# A fake MediaWiki::API handle: ->edit() pops the next scripted outcome. A
+# hashref with {ok} succeeds (and is returned); otherwise it sets
+# {error}{code,details} and returns false, exactly like the real client.
 package FakeWiki;
 sub new { my ($c, @script) = @_; return bless { script => [@script], error => {} }, $c; }
 sub edit {
@@ -91,28 +102,28 @@ sub edit {
 }
 package main;
 
-# ---- classifier truth table -----------------------------------------------
+# ---- classifier truth table (positive AND negative on both axes) -----------
 for my $c (
-	['internal_api_error_DBQueryError: ...', 1, 0, 'DB deadlock -> transient, not auth'],
-	['ratelimited',                          1, 0, 'rate limit -> transient'],
-	['maxlag: 7 seconds',                    1, 0, 'replica lag -> transient'],
-	['readonly: maintenance',                1, 0, 'read-only -> transient'],
-	['HTTP 503 Service Unavailable',         1, 0, '5xx -> transient'],
-	['badtoken',                             1, 1, 'stale token -> transient AND auth'],
-	['assertuserfailed',                     1, 1, 'dropped login -> transient AND auth'],
-	['permissiondenied',                     0, 0, 'permission -> NOT transient'],
-	['protectedpage',                        0, 0, 'protected -> NOT transient'],
-	['sitecssprotected',                     0, 0, 'site CSS -> NOT transient'],
-	['editconflict',                         0, 0, 'real conflict -> NOT transient'],
+	['internal_api_error_DBQueryError: ...', 1, 0, 'DB deadlock'],
+	['ratelimited',                          1, 0, 'rate limit'],
+	['maxlag: 7 seconds',                    1, 0, 'replica lag'],
+	['readonly: maintenance',                1, 0, 'read-only'],
+	['HTTP 503 Service Unavailable',         1, 0, '5xx'],
+	['badtoken',                             1, 1, 'stale token'],
+	['assertuserfailed',                     1, 1, 'dropped login'],
+	['permissiondenied',                     0, 0, 'permission'],
+	['protectedpage',                        0, 0, 'protected'],
+	['sitecssprotected',                     0, 0, 'site CSS'],
+	['editconflict',                         0, 0, 'real conflict'],
 ) {
 	my ($err, $want_t, $want_a, $desc) = @{$c};
 	is(PushRetry::is_transient_api_error($err) ? 1 : 0, $want_t, "transient: $desc");
-	is(PushRetry::is_auth_transient($err) ? 1 : 0, $want_a, "auth: $desc") if $want_a;
+	is(PushRetry::is_auth_transient($err) ? 1 : 0, $want_a, "auth: $desc");
 }
 
-# ---- transient edit: retry with backoff, then recover ---------------------
+# ---- transient edit: capped exponential backoff, then recover --------------
 {
-	@sleeps = (); @reconnects = ();
+	set_max_retries(3); @sleeps = (); @reconnects = ();
 	$PushRetry::mediawiki = FakeWiki->new(
 		{ details => 'internal_api_error_DBQueryError' },
 		{ details => 'internal_api_error_DBQueryError' },
@@ -120,15 +131,13 @@ for my $c (
 	);
 	my $r = quiet { PushRetry::mw_api_edit_retry({ title => 'P' }, { skip_encoding => 1 }, "pushing 'P'") };
 	ok($r && $r->{ok}, 'transient DBQueryError recovered after retries');
-	is_deeply(\@sleeps, [1, 2], 'escalating backoff 1s then 2s');
+	is_deeply(\@sleeps, [1, 2], 'exponential backoff 1s then 2s');
 	is_deeply(\@reconnects, ['warm', 'warm'], 'DB transient reuses the WARM handle (no needless relogin)');
 }
 
-# ---- auth transient (badtoken): rebuild the handle, then recover ----------
+# ---- auth transient (badtoken): rebuild the handle, then recover -----------
 {
-	@sleeps = (); @reconnects = (); @fresh_handles = ();
-	# After the badtoken, connect_maybe(undef,...) must hand back a NEW handle
-	# whose edit succeeds (the fresh login + fresh CSRF token).
+	set_max_retries(3); @sleeps = (); @reconnects = (); @fresh_handles = ();
 	@fresh_handles = ( FakeWiki->new({ ok => 1, edit => { newrevid => 8 } }) );
 	$PushRetry::mediawiki = FakeWiki->new({ details => 'badtoken' });
 	my $r = quiet { PushRetry::mw_api_edit_retry({ title => 'P' }, undef, "pushing 'P'") };
@@ -136,20 +145,20 @@ for my $c (
 	is_deeply(\@reconnects, ['fresh'], 'auth transient REBUILDS the handle (connect_maybe(undef)) -- the B1 fix');
 }
 
-# ---- non-transient: return undef immediately, no retry --------------------
+# ---- non-transient: return undef immediately, no retry ---------------------
 {
-	@sleeps = (); @reconnects = ();
+	set_max_retries(3); @sleeps = (); @reconnects = ();
 	$PushRetry::mediawiki = FakeWiki->new({ code => 3, details => 'permissiondenied' });
 	my $r = quiet { PushRetry::mw_api_edit_retry({ title => 'P' }, undef, "pushing 'P'") };
 	ok(!defined $r, 'permissiondenied returns undef (caller skips/classifies) -- no retry');
 	is_deeply(\@sleeps, [], 'non-transient never backs off');
 }
 
-# ---- unrecoverable transient: exhaust the budget, fail closed -------------
+# ---- unrecoverable transient: exhaust the configured budget, fail closed ---
 {
-	@sleeps = (); @reconnects = ();
+	set_max_retries(3); @sleeps = (); @reconnects = ();
 	$PushRetry::mediawiki = FakeWiki->new( map { { details => 'Deadlock found' } } 1 .. 9 );
 	my $r = quiet { PushRetry::mw_api_edit_retry({ title => 'P' }, undef, "pushing 'P'") };
 	ok(!defined $r, 'an unrecoverable transient returns undef after the budget (no silent success)');
-	is(scalar(@sleeps), 8, 'exactly 8 retry attempts before giving up');
+	is(scalar(@sleeps), 3, 'honours maxRetries=3: exactly 3 retry attempts before giving up');
 }
