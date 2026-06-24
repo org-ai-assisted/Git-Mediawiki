@@ -1788,6 +1788,18 @@ sub resume_trim_commit_pairs {
 	return $pairs;
 }
 
+# True if commit $ancestor is an ancestor of (or equal to) commit $descendant.
+# `git merge-base --is-ancestor` exits 0 (yes) / 1 (no) -- a normal result, not
+# an error -- so it is run directly and the status checked, rather than via
+# run_git_quoted (which dies on a non-zero exit). (Local fork change.)
+sub git_is_ancestor {
+	my ($ancestor, $descendant) = @_;
+	return 0 if !defined($ancestor) || !defined($descendant)
+		|| $ancestor eq q{} || $descendant eq q{};
+	system('git', 'merge-base', '--is-ancestor', $ancestor, $descendant);
+	return ($? == 0);
+}
+
 sub mw_push_revision {
 	my $local = shift;
 	my $remote = shift;						# actually, this has to be "refs/heads/master" at this point.
@@ -1803,7 +1815,22 @@ sub mw_push_revision {
 	my $remoteorigin_sha1 = run_git_quoted_nostderr(["rev-parse", "refs/remotes/${remotename}/master"]);
 	chomp($remoteorigin_sha1);
 
-	if ($last_local_revid > 0 && $last_local_revid < $last_remote_revid) {
+	# Read any resume checkpoint from a previous interrupted push BEFORE the
+	# non-fast-forward guard below. A checkpoint that is an ancestor of HEAD means
+	# the remote was advanced by OUR OWN interrupted push (whose tracking note did
+	# not catch up) -- not by a genuine remote change -- so the remote being ahead
+	# of $last_local_revid is expected and must NOT be rejected as non-fast-forward;
+	# the trim further down then skips the commits already pushed. (Local fork change.)
+	my $checkpoint_ref = "refs/mediawiki/${remotename}/push-checkpoint";
+	my $checkpoint = q{};
+	if ($push_resume) {
+		# for-each-ref exits 0 whether or not the ref exists (empty when absent).
+		$checkpoint = run_git_quoted(["for-each-ref", "--format=%(objectname)", $checkpoint_ref]);
+		chomp($checkpoint);
+	}
+	my $resuming = ($checkpoint ne q{} && git_is_ancestor($checkpoint, $HEAD_sha1));
+
+	if (!$resuming && $last_local_revid > 0 && $last_local_revid < $last_remote_revid) {
 		return error_non_fast_forward($remote);
 	}
 
@@ -1868,15 +1895,9 @@ sub mw_push_revision {
 		}
 	}
 
-	# Resume an interrupted push: if a prior run left a checkpoint at the last
-	# fully-pushed commit and it is on this push path, skip the commits already
-	# sent instead of re-pushing the whole history (see resume_trim_commit_pairs).
-	my $checkpoint_ref = "refs/mediawiki/${remotename}/push-checkpoint";
-	if ($push_resume) {
-		# for-each-ref exits 0 whether or not the ref exists (empty when absent),
-		# so reading the checkpoint never dies on a first push.
-		my $checkpoint = run_git_quoted(["for-each-ref", "--format=%(objectname)", $checkpoint_ref]);
-		chomp($checkpoint);
+	# Resume an interrupted push: drop the commits already sent ($checkpoint and
+	# $checkpoint_ref were read above, before the non-fast-forward guard).
+	if ($push_resume && $checkpoint ne q{}) {
 		my $before = scalar @commit_pairs;
 		@commit_pairs = @{ resume_trim_commit_pairs(\@commit_pairs, $checkpoint) };
 		my $skipped = $before - scalar(@commit_pairs);

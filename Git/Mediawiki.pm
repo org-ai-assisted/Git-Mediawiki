@@ -154,14 +154,37 @@ sub connect_maybe {
 		my $request = {lgname => $credential{username},
 										lgpassword => $credential{password},
 										lgdomain => $wiki_domain};
-		if ($wiki->login($request)) {
-			Git::credential(\%credential, 'approve');
-			print {*STDERR} qq(Logged in mediawiki user "$credential{username}".\n);
-		} else {
+		# Retry a transient login failure with backoff before the fatal exit. A
+		# long bulk push can outlive its server session; the re-login that then
+		# follows (connect_maybe(undef,...) on a badtoken) can race a momentary
+		# server error / login throttle -- and since the credentials are already
+		# known-good at that point, a failure here is almost always transient.
+		# Without this, the single-attempt login exit 1'd and killed the whole
+		# push (the bug behind a mid-push "Login Failure" abort). Bounded by
+		# maxRetries; a genuinely rejected credential still fails after the
+		# attempts. (Local fork change.)
+		my $login_attempt = 0;
+		my $logged_in = 0;
+		while (1) {
+			if ($wiki->login($request)) {
+				Git::credential(\%credential, 'approve');
+				print {*STDERR} qq(Logged in mediawiki user "$credential{username}".\n);
+				$logged_in = 1;
+				last;
+			}
+			last if $login_attempt >= $max_retries;
+			$login_attempt++;
+			print {*STDERR} qq(Transient login failure for "$credential{username}" )
+				. qq{(attempt ${login_attempt}): }
+				. ($wiki->{error}->{code} // q{}) . q{: }
+				. ($wiki->{error}->{details} // q{}) . "; retrying...\n";
+			sleep($login_attempt * 2);
+		}
+		if (!$logged_in) {
 			print {*STDERR} qq(Failed to log in mediawiki user "$credential{username}" on ${remote_url}\n);
 			print {*STDERR} '  (error ' .
-				$wiki->{error}->{code} . ': ' .
-				$wiki->{error}->{details} . ")\n";
+				($wiki->{error}->{code} // q{}) . ': ' .
+				($wiki->{error}->{details} // q{}) . ")\n";
 			Git::credential(\%credential, 'reject');
 			exit 1;
 		}
