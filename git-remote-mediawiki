@@ -234,6 +234,20 @@ if (!$dumb_push) {
 chomp($dumb_push);
 $dumb_push = ($dumb_push eq 'true');
 
+# Resumable push: checkpoint the last fully-pushed commit on a per-remote ref so
+# an INTERRUPTED push (crash, deadlock, dropped connection, Ctrl-C) resumes from
+# there on the next push instead of re-sending every page. Enabled by default;
+# set remote.<remotename>.pushResume=false (or mediawiki.pushResume=false) to
+# disable. The checkpoint is deleted on a fully successful push. (Local fork
+# change -- resumability for bulk content sync.)
+my $push_resume = run_git_quoted(["config", "--get", "--bool", "remote.${remotename}.pushResume"]);
+chomp($push_resume);
+if ($push_resume eq q{}) {
+	$push_resume = run_git_quoted(["config", "--get", "--bool", "mediawiki.pushResume"]);
+	chomp($push_resume);
+}
+$push_resume = ($push_resume ne 'false');   # default ON: empty or 'true' enables
+
 my $wiki_name = $url;
 $wiki_name =~ s{[^/]*://}{};
 # If URL is like http://user:password@example.com/, we clearly don't
@@ -1756,6 +1770,24 @@ sub mw_push {
 	return;
 }
 
+# Resume support: given the ordered (oldest-first) [parent, child] commit-pair
+# list a push is about to send and the child SHA recorded by a previous
+# interrupted push's checkpoint, drop the commits already fully pushed
+# (everything up to AND including the checkpoint commit) so the push continues
+# where it left off. Returns the trimmed arrayref; if the checkpoint is empty or
+# not on this push path (stale / a different HEAD), the list is returned
+# unchanged. Pure -- no git, no network -- so it is unit-testable. (Local fork change.)
+sub resume_trim_commit_pairs {
+	my ($pairs, $checkpoint) = @_;
+	return $pairs if !defined($checkpoint) || $checkpoint eq q{};
+	for (my $i = 0; $i < scalar(@{$pairs}); $i++) {
+		if ($pairs->[$i]->[1] eq $checkpoint) {
+			return [ @{$pairs}[$i + 1 .. $#{$pairs}] ];
+		}
+	}
+	return $pairs;
+}
+
 sub mw_push_revision {
 	my $local = shift;
 	my $remote = shift;						# actually, this has to be "refs/heads/master" at this point.
@@ -1836,6 +1868,23 @@ sub mw_push_revision {
 		}
 	}
 
+	# Resume an interrupted push: if a prior run left a checkpoint at the last
+	# fully-pushed commit and it is on this push path, skip the commits already
+	# sent instead of re-pushing the whole history (see resume_trim_commit_pairs).
+	my $checkpoint_ref = "refs/mediawiki/${remotename}/push-checkpoint";
+	if ($push_resume) {
+		# for-each-ref exits 0 whether or not the ref exists (empty when absent),
+		# so reading the checkpoint never dies on a first push.
+		my $checkpoint = run_git_quoted(["for-each-ref", "--format=%(objectname)", $checkpoint_ref]);
+		chomp($checkpoint);
+		my $before = scalar @commit_pairs;
+		@commit_pairs = @{ resume_trim_commit_pairs(\@commit_pairs, $checkpoint) };
+		my $skipped = $before - scalar(@commit_pairs);
+		if ($skipped > 0) {
+			print {*STDERR} "Resuming push after checkpoint ${checkpoint}: skipping ${skipped} already-pushed commit(s).\n";
+		}
+	}
+
 	foreach my $commit_info_split (@commit_pairs) {
 		my $sha1_child = @{$commit_info_split}[0];
 		my $sha1_commit = @{$commit_info_split}[1];
@@ -1874,6 +1923,20 @@ sub mw_push_revision {
 					"mediawiki_revision: ${mw_revision}",
 					$sha1_commit]);
 		}
+		# Advance the resume checkpoint: this commit and all its files are now
+		# fully pushed, so an interruption after this point resumes from here.
+		if ($push_resume) {
+			run_git_quoted(["update-ref", $checkpoint_ref, $sha1_commit]);
+		}
+	}
+
+	# Whole push succeeded -- git advances the remote-tracking ref via the "ok"
+	# below, so the checkpoint is no longer needed; drop it (guarded so a
+	# never-created checkpoint does not error).
+	if ($push_resume) {
+		my $cp = run_git_quoted(["for-each-ref", "--format=%(objectname)", $checkpoint_ref]);
+		chomp($cp);
+		run_git_quoted(["update-ref", "-d", $checkpoint_ref]) if $cp ne q{};
 	}
 
 	print {*STDOUT} "ok ${remote}\n";
