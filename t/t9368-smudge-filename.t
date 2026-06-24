@@ -19,7 +19,7 @@ use strict;
 use warnings;
 use FindBin;
 use lib "$FindBin::Bin/..";
-use Test::More tests => 14;
+use Test::More tests => 18;
 use Encode qw(encode_utf8 decode_utf8);
 use POSIX qw(NAME_MAX);                # the same byte budget smudge_filename uses
 use Git::Mediawiki qw(clean_filename smudge_filename);
@@ -35,6 +35,12 @@ unlike(smudge_filename('_%_2e_%_2e_%_2fetc'), qr{[.][.]/}, 'no ../ traversal fro
 # the legitimately-encoded forbidden characters ARE decoded back
 is(smudge_filename('a_%_5bb_%_5dc'), 'a[b]c', 'decodes _%_5b/_%_5d back to [ ]');
 is(smudge_filename('x_%_7cy'), 'x|y', 'decodes _%_7c back to a pipe');
+
+# ---- defence in depth: path separators + control bytes scrubbed to '_' ------
+is(smudge_filename("a/b"), 'a%2Fb', 'slash is encoded (SLASH_REPLACEMENT), not left raw');
+is(smudge_filename("a\x{00}b"), 'a_b', 'NUL byte scrubbed to _');
+is(smudge_filename("a\x{1f}b"), 'a_b', 'C0 control byte (U+001F) scrubbed to _');
+is(smudge_filename("a\x{7f}b"), 'a_b', 'DEL byte (U+007F) scrubbed to _');
 
 # ---- clean -> smudge round-trip preserves the forbidden set ----------------
 for my $name ('Foo[bar]', 'a|b', '{tpl}') {
