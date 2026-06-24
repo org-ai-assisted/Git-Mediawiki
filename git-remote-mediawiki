@@ -1554,36 +1554,49 @@ sub mw_push_file {
 		# already-existing page as a bogus conflict (code 3 -> aborts the whole
 		# restore). Omitting it is last-write-wins, the correct semantics for a
 		# one-directional content restore. (Local fork change.)
-		my $result = $mediawiki->edit( {
-			action => 'edit',
-			summary => $summary,
-			title => $title,
-			text => mediawiki_clean($file_content, $page_created),
-				  }, {
-					  skip_encoding => 1 # Helps with names with accentuated characters
-				  });
-		if (!$result) {
+		my $result;
+		my $push_attempt = 0;
+		while (1) {
+			$result = $mediawiki->edit( {
+				action => 'edit',
+				summary => $summary,
+				title => $title,
+				text => mediawiki_clean($file_content, $page_created),
+					  }, {
+						  skip_encoding => 1 # Helps with names with accentuated characters
+					  });
+			last if $result;
 			my $err_details = $mediawiki->{error}->{details} || q{};
+			my $err_code = $mediawiki->{error}->{code} // 0;
 			# A page that cannot be edited on THIS wiki (protected namespace /
-			# protected page / missing permission) should be SKIPPED, not treated
-			# as a conflict that aborts the whole push. This is common when
-			# restoring a clone onto a wiki that locks some namespaces (e.g. Talk).
-			# (Local fork change.)
-			if ($err_details =~ /protectednamespace|protectedpage|cascadeprotected|customcssprotected|customjsprotected|permissiondenied|protectedtitle|cantcreate|namespaceprotected/) {
+			# protected page / protected site CSS-JS / missing permission) should
+			# be SKIPPED, not treated as a conflict that aborts the whole push.
+			# This is common when restoring a clone onto a wiki that locks some
+			# namespaces (e.g. Talk) or site interface pages. (Local fork change.)
+			if ($err_details =~ /protectednamespace|protectedpage|cascadeprotected|customcssprotected|customjsprotected|sitecssprotected|sitejsprotected|permissiondenied|protectedtitle|cantcreate|namespaceprotected/) {
 				print {*STDERR} "Skipping '${title}' (not editable on this wiki): ${err_details}\n";
 				return ($oldrevid, 'ok');
 			}
-			if ($mediawiki->{error}->{code} == 3) {
-				# edit conflicts, considered as non-fast-forward
-				print {*STDERR} 'Warning: Error ' .
-					$mediawiki->{error}->{code} .
-					' from mediawiki: ' . $err_details .
-					".\n";
+			# Transient server-side errors under a heavy bulk restore (DB hiccup /
+			# deadlock, rate limit, replica lag, read-only, 5xx, lost connection,
+			# stale token): RETRY with backoff rather than aborting the entire
+			# push. MediaWiki surfaces these as code 3 too, otherwise
+			# indistinguishable from a genuine edit conflict. (Local fork change.)
+			if ($push_attempt < 8 && $err_details =~ /DBQueryError|internal_api_error|ratelimited|maxlag|readonly|badtoken|Service.?Unavailable|HTTP.?50[0-9]|timed?.?out|Lost connection|Deadlock/i) {
+				$push_attempt++;
+				print {*STDERR} "Transient error pushing '${title}' (attempt ${push_attempt}): ${err_details}; retrying...\n";
+				sleep($push_attempt);
+				$mediawiki = connect_maybe($mediawiki, $remotename, $url);
+				next;
+			}
+			if ($err_code == 3) {
+				# genuine edit conflict, considered as non-fast-forward
+				print {*STDERR} 'Warning: Error ' . $err_code .
+					' from mediawiki: ' . $err_details . ".\n";
 				return ($oldrevid, 'non-fast-forward');
 			} else {
 				# Other errors. Shouldn't happen => just die()
-				die 'Fatal: Error ' .
-					$mediawiki->{error}->{code} .
+				die 'Fatal: Error ' . $err_code .
 					' from mediawiki: ' . $err_details . "\n";
 			}
 		}
