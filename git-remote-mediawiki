@@ -1943,7 +1943,15 @@ sub mw_push_revision {
 	return 1;
 }
 
+## The wiki's allowed file extensions do not change during a push, but
+## mw_upload_file calls this once PER media file -- so on a media-heavy push it
+## fired a redundant siteinfo round-trip for every binary (hundreds/thousands).
+## Cache the result for the lifetime of the process. (Local fork change -- perf.)
+my %allowed_file_extensions_cache;
+my $allowed_file_extensions_cached = 0;
 sub get_allowed_file_extensions {
+	return %allowed_file_extensions_cache if $allowed_file_extensions_cached;
+
 	$mediawiki = connect_maybe($mediawiki, $remotename, $url);
 
 	my $query = {
@@ -1953,9 +1961,10 @@ sub get_allowed_file_extensions {
 	};
 	my $result = $mediawiki->api($query);
 	my @file_extensions = map { $_->{ext}} @{$result->{query}->{fileextensions}};
-	my %hashFile = map { $_ => 1 } @file_extensions;
+	%allowed_file_extensions_cache = map { $_ => 1 } @file_extensions;
+	$allowed_file_extensions_cached = 1;
 
-	return %hashFile;
+	return %allowed_file_extensions_cache;
 }
 
 # In memory cache for MediaWiki namespace ids.
