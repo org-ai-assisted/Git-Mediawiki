@@ -1442,6 +1442,56 @@ sub error_non_fast_forward {
 	return 0;
 }
 
+# Classify a MediaWiki API error (by its DETAILS string) as a transient
+# server-side failure worth retrying under a heavy bulk push: a DB hiccup or
+# InnoDB deadlock, rate limit, replica lag, read-only window, 5xx, a dropped
+# connection, or a stale CSRF/session token. MediaWiki surfaces several of
+# these as edit code 3 -- indistinguishable from a genuine edit conflict -- so
+# the classification is by string, not code. (Local fork change.)
+sub is_transient_api_error {
+	my $err_details = shift // q{};
+	return $err_details =~ /DBQueryError|internal_api_error|ratelimited|maxlag|readonly|badtoken|assertuserfailed|assertbotfailed|Service.?Unavailable|HTTP.?50[0-9]|timed?.?out|Lost connection|Deadlock/i;
+}
+
+# A stale CSRF/session token (badtoken) or a dropped login (assert*failed) is
+# only cured by REBUILDING the API handle -- a fresh login fetches a fresh
+# token. connect_maybe() returns the SAME handle when one already exists, so a
+# warm-handle reconnect would NOT refresh the token; only passing undef does.
+# A plain network/DB blip needs no relogin, so reuse the warm handle there.
+sub is_auth_transient {
+	my $err_details = shift // q{};
+	return $err_details =~ /badtoken|assertuserfailed|assertbotfailed|notloggedin|mustbeloggedin|session/i;
+}
+
+# Run one MediaWiki edit/upload/delete API call, retrying TRANSIENT server-side
+# failures with escalating backoff instead of aborting the whole push. Returns
+# the API result on success, or undef for a non-transient failure / exhausted
+# retries (with $mediawiki->{error} still set, so the caller can classify it as
+# skip / conflict / fatal). On an auth-class transient the handle is rebuilt to
+# re-login and refresh the CSRF token. Shared by page edits and media uploads
+# so both paths get identical resilience. (Local fork change.)
+sub mw_api_edit_retry {
+	my ($query, $opts, $what) = @_;
+	my $attempt = 0;
+	while (1) {
+		my $result = $opts ? $mediawiki->edit($query, $opts)
+				   : $mediawiki->edit($query);
+		return $result if $result;
+		my $err_details = $mediawiki->{error}->{details} || q{};
+		if (!($attempt < 8 && is_transient_api_error($err_details))) {
+			return;
+		}
+		$attempt++;
+		print {*STDERR} "Transient error ${what} (attempt ${attempt}): ${err_details}; retrying...\n";
+		sleep($attempt);
+		if (is_auth_transient($err_details)) {
+			$mediawiki = connect_maybe(undef, $remotename, $url);
+		} else {
+			$mediawiki = connect_maybe($mediawiki, $remotename, $url);
+		}
+	}
+}
+
 sub mw_upload_file {
 	my $complete_file_name = shift;
 	my $new_sha1 = shift;
@@ -1464,7 +1514,7 @@ sub mw_upload_file {
 			title => $path,
 			reason => $summary
 		};
-		if (!$mediawiki->edit($query)) {
+		if (!mw_api_edit_retry($query, undef, "deleting file '${path}'")) {
 			print {*STDERR} "Failed to delete file on remote wiki\n";
 			print {*STDERR} "Check your permissions on the remote site. Error code:\n";
 			print {*STDERR} $mediawiki->{error}->{code} . ':' . $mediawiki->{error}->{details};
@@ -1477,7 +1527,7 @@ sub mw_upload_file {
 			$mediawiki = connect_maybe($mediawiki, $remotename, $url);
 			$mediawiki->{config}->{upload_url} =
 				"${url}/index.php/Special:Upload";
-			$mediawiki->edit({
+			mw_api_edit_retry({
 				action => 'upload',
 				filename => $complete_file_name,
 				comment => $summary,
@@ -1487,7 +1537,8 @@ sub mw_upload_file {
 				ignorewarnings => 1,
 			}, {
 				skip_encoding => 1
-			} ) || die $mediawiki->{error}->{code} . ':'
+			}, "uploading '${complete_file_name}'" )
+				|| die $mediawiki->{error}->{code} . ':'
 				 . $mediawiki->{error}->{details} . "\n";
 			my $last_file_page = $mediawiki->get_page({title => $path});
 			$newrevid = $last_file_page->{revid};
@@ -1554,18 +1605,21 @@ sub mw_push_file {
 		# already-existing page as a bogus conflict (code 3 -> aborts the whole
 		# restore). Omitting it is last-write-wins, the correct semantics for a
 		# one-directional content restore. (Local fork change.)
-		my $result;
-		my $push_attempt = 0;
-		while (1) {
-			$result = $mediawiki->edit( {
-				action => 'edit',
-				summary => $summary,
-				title => $title,
-				text => mediawiki_clean($file_content, $page_created),
-					  }, {
-						  skip_encoding => 1 # Helps with names with accentuated characters
-					  });
-			last if $result;
+		# Transient server-side errors under a heavy bulk restore (DB hiccup /
+		# deadlock, rate limit, replica lag, read-only, 5xx, lost connection,
+		# stale token) are retried with backoff inside mw_api_edit_retry rather
+		# than aborting the entire push; an auth-class transient there rebuilds
+		# the handle to refresh the CSRF token. A non-transient failure returns
+		# undef with $mediawiki->{error} set, classified below. (Local fork change.)
+		my $result = mw_api_edit_retry({
+			action => 'edit',
+			summary => $summary,
+			title => $title,
+			text => mediawiki_clean($file_content, $page_created),
+		}, {
+			skip_encoding => 1 # Helps with names with accentuated characters
+		}, "pushing '${title}'");
+		if (!$result) {
 			my $err_details = $mediawiki->{error}->{details} || q{};
 			my $err_code = $mediawiki->{error}->{code} // 0;
 			# A page that cannot be edited on THIS wiki (protected namespace /
@@ -1577,20 +1631,9 @@ sub mw_push_file {
 				print {*STDERR} "Skipping '${title}' (not editable on this wiki): ${err_details}\n";
 				return ($oldrevid, 'ok');
 			}
-			# Transient server-side errors under a heavy bulk restore (DB hiccup /
-			# deadlock, rate limit, replica lag, read-only, 5xx, lost connection,
-			# stale token): RETRY with backoff rather than aborting the entire
-			# push. MediaWiki surfaces these as code 3 too, otherwise
-			# indistinguishable from a genuine edit conflict. (Local fork change.)
-			if ($push_attempt < 8 && $err_details =~ /DBQueryError|internal_api_error|ratelimited|maxlag|readonly|badtoken|Service.?Unavailable|HTTP.?50[0-9]|timed?.?out|Lost connection|Deadlock/i) {
-				$push_attempt++;
-				print {*STDERR} "Transient error pushing '${title}' (attempt ${push_attempt}): ${err_details}; retrying...\n";
-				sleep($push_attempt);
-				$mediawiki = connect_maybe($mediawiki, $remotename, $url);
-				next;
-			}
 			if ($err_code == 3) {
-				# genuine edit conflict, considered as non-fast-forward
+				# genuine edit conflict (or a transient that outlasted the
+				# retries), considered as non-fast-forward
 				print {*STDERR} 'Warning: Error ' . $err_code .
 					' from mediawiki: ' . $err_details . ".\n";
 				return ($oldrevid, 'non-fast-forward');
