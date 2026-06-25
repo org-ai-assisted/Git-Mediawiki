@@ -400,13 +400,20 @@ sub get_mw_page_list {
 	my $pages = shift;
 	my @some_pages = @{$page_list};
 	while (@some_pages) {
-		my $last_page = SLICE_SIZE;
+		# Batch by SLICE_SIZE TITLES per query. The API caps the `titles`
+		# parameter at 50 for non-bot logins, so each slice must hold exactly
+		# SLICE_SIZE elements -- indices 0..SLICE_SIZE-1. The old 0..SLICE_SIZE
+		# took SLICE_SIZE+1 (51) and the API rejected the whole query
+		# ("too many values supplied for parameter titles. The limit is 50"),
+		# so tracking more than 50 individual pages failed outright. The leftover
+		# tail must then start at SLICE_SIZE, not SLICE_SIZE+1. (Local fork change.)
+		my $last_page = SLICE_SIZE - 1;
 		if ($#some_pages < $last_page) {
 			$last_page = $#some_pages;
 		}
 		my @slice = @some_pages[0..$last_page];
 		get_mw_first_pages(\@slice, $pages);
-		@some_pages = @some_pages[(SLICE_SIZE + 1)..$#some_pages];
+		@some_pages = @some_pages[SLICE_SIZE..$#some_pages];
 	}
 	return;
 }
