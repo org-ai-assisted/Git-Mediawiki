@@ -1623,7 +1623,7 @@ sub mw_upload_file {
 			$mediawiki = connect_maybe($mediawiki, $remotename, $url);
 			$mediawiki->{config}->{upload_url} =
 				"${url}/index.php/Special:Upload";
-			mw_api_edit_retry({
+			my $uploaded = mw_api_edit_retry({
 				action => 'upload',
 				filename => $complete_file_name,
 				comment => $summary,
@@ -1633,9 +1633,21 @@ sub mw_upload_file {
 				ignorewarnings => 1,
 			}, {
 				skip_encoding => 1
-			}, "uploading '${complete_file_name}'" )
-				|| die $mediawiki->{error}->{code} . ':'
-				 . $mediawiki->{error}->{details} . "\n";
+			}, "uploading '${complete_file_name}'" );
+			if (!$uploaded) {
+				my $err_code = $mediawiki->{error}->{code} // q{};
+				my $err_details = $mediawiki->{error}->{details} // q{};
+				# 'fileexists-no-change': the remote already holds the EXACT same
+				# bytes, so the upload is a no-op rather than a failure. This shows
+				# up on an idempotent re-push (a resumed/checkpointed push that
+				# re-offers an already-uploaded file). Treat it as success and skip
+				# instead of aborting the WHOLE push. (Local fork change.)
+				if ($err_details =~ /fileexists-no-change/) {
+					print {*STDERR} "File ${complete_file_name} already identical on remote; skipping.\n";
+				} else {
+					die $err_code . ':' . $err_details . "\n";
+				}
+			}
 			my $last_file_page = $mediawiki->get_page({title => $path});
 			$newrevid = $last_file_page->{revid};
 			print {*STDERR} "Pushed file: ${new_sha1} - ${complete_file_name}.\n";
