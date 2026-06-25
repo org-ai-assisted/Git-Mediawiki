@@ -675,14 +675,21 @@ sub get_mw_mediafile_for_page_revision {
 	my $timestamp = shift;
 	my %mediafile;
 
-	# Search if on a media file with given timestamp exists on
-	# MediaWiki. In that case download the file.
+	# Fetch the file version CURRENT AS OF this page revision -- NOT one uploaded
+	# at the EXACT page-revision timestamp. A File: page's description revisions and
+	# its file-upload versions are independent timelines: when the page was edited
+	# or (re-)imported after the upload (e.g. a wiki migration's "1 revision
+	# imported" commit), the latest page-revision timestamp matches NO file version.
+	# The old iistart==iiend exact match then returned nothing and the binary was
+	# silently skipped -- this is exactly why description-less / post-upload-edited
+	# files (e.g. the payment-logo icons) cloned with an empty File: page and no
+	# media. iistart alone enumerates newest-first from $timestamp backwards, so
+	# iilimit=1 yields the version in effect at that revision. (Local fork change.)
 	my $query = {
 		action => 'query',
 		prop => 'imageinfo',
 		titles => "File:${filename}",
 		iistart => $timestamp,
-		iiend => $timestamp,
 		iiprop => 'timestamp|archivename|url',
 		iilimit => 1
 	};
