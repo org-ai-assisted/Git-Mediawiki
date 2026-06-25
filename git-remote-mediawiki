@@ -893,21 +893,6 @@ sub get_last_remote_revision {
 }
 
 # Clean content before sending it to MediaWiki
-sub as_utf8_bytes {
-	# _run_git reads blobs via ':encoding(UTF-8)', so page content (and titles /
-	# summaries derived from git) are WIDE-CHAR strings. The edit/upload API calls
-	# pass skip_encoding => 1 (MediaWiki::API does NOT encode), and modern
-	# libwww-perl rejects a wide-char string in an HTTP body with "HTTP::Message
-	# content must be bytes". All-ASCII content happens to pass; a page that
-	# carries any non-ASCII byte aborts the whole push. Encode to UTF-8 bytes here
-	# so the wire payload is always bytes; a no-op on an already-byte string.
-	# (Local fork change.)
-	my $s = shift;
-	return $s if !defined $s;
-	utf8::encode($s) if utf8::is_utf8($s);
-	return $s;
-}
-
 sub mediawiki_clean {
 	my $string = shift;
 	my $page_created = shift;
@@ -1576,19 +1561,6 @@ sub is_auth_transient {
 # so both paths get identical resilience. (Local fork change.)
 sub mw_api_edit_retry {
 	my ($query, $opts, $what) = @_;
-	# MediaWiki::API::_encode_hashref_utf8 runs Encode::_utf8_on() on every scalar
-	# param UNCONDITIONALLY -- even under skip_encoding => 1, which git-mediawiki
-	# sets. On a WIDE-char string (page text / title / summary / delete reason, all
-	# read by _run_git via ':encoding(UTF-8)') that leaves a high-codepoint flagged
-	# string, and modern libwww-perl then aborts the POST with "HTTP::Message
-	# content must be bytes". Pre-encode every scalar param to UTF-8 BYTES at this
-	# single chokepoint (covers edit / upload / delete): _utf8_on on a byte string
-	# only re-flags codepoints 0-255, which stay downgradeable so the POST succeeds.
-	# Array refs (the upload's raw-bytes file spec) are skipped and stay raw.
-	# (Local fork change.)
-	for my $k (keys %{$query}) {
-		$query->{$k} = as_utf8_bytes($query->{$k}) if !ref($query->{$k});
-	}
 	my $attempt = 0;
 	my $backoff = RETRY_BACKOFF_BASE;
 	while (1) {
@@ -1656,7 +1628,7 @@ sub mw_upload_file {
 				filename => $complete_file_name,
 				comment => $summary,
 				file => [undef,
-					 as_utf8_bytes($complete_file_name),
+					 $complete_file_name,
 					 Content => $content],
 				ignorewarnings => 1,
 			}, {
