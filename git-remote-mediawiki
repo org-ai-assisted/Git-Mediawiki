@@ -1628,6 +1628,12 @@ sub mw_upload_file {
 	}
 	# Deleting and uploading a file requires a privileged user
 	if ($file_deleted) {
+		# A delete is wiki-mutating (and non-idempotent), so dry-run must skip it
+		# too -- not just the upload branch below. (Local fork change.)
+		if ($dry_run) {
+			print {*STDERR} "DRY-RUN: would delete '${path}'; skipped.\n";
+			return $newrevid;
+		}
 		$mediawiki = connect_maybe($mediawiki, $remotename, $url);
 		my $query = {
 			action => 'delete',
