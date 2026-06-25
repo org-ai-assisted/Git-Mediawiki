@@ -893,6 +893,21 @@ sub get_last_remote_revision {
 }
 
 # Clean content before sending it to MediaWiki
+sub as_utf8_bytes {
+	# _run_git reads blobs via ':encoding(UTF-8)', so page content (and titles /
+	# summaries derived from git) are WIDE-CHAR strings. The edit/upload API calls
+	# pass skip_encoding => 1 (MediaWiki::API does NOT encode), and modern
+	# libwww-perl rejects a wide-char string in an HTTP body with "HTTP::Message
+	# content must be bytes". All-ASCII content happens to pass; a page that
+	# carries any non-ASCII byte aborts the whole push. Encode to UTF-8 bytes here
+	# so the wire payload is always bytes; a no-op on an already-byte string.
+	# (Local fork change.)
+	my $s = shift;
+	return $s if !defined $s;
+	utf8::encode($s) if utf8::is_utf8($s);
+	return $s;
+}
+
 sub mediawiki_clean {
 	my $string = shift;
 	my $page_created = shift;
@@ -1625,10 +1640,10 @@ sub mw_upload_file {
 				"${url}/index.php/Special:Upload";
 			my $uploaded = mw_api_edit_retry({
 				action => 'upload',
-				filename => $complete_file_name,
-				comment => $summary,
+				filename => as_utf8_bytes($complete_file_name),
+				comment => as_utf8_bytes($summary),
 				file => [undef,
-					 $complete_file_name,
+					 as_utf8_bytes($complete_file_name),
 					 Content => $content],
 				ignorewarnings => 1,
 			}, {
@@ -1721,9 +1736,9 @@ sub mw_push_file {
 		# undef with $mediawiki->{error} set, classified below. (Local fork change.)
 		my $result = mw_api_edit_retry({
 			action => 'edit',
-			summary => $summary,
-			title => $title,
-			text => mediawiki_clean($file_content, $page_created),
+			summary => as_utf8_bytes($summary),
+			title => as_utf8_bytes($title),
+			text => as_utf8_bytes(mediawiki_clean($file_content, $page_created)),
 		}, {
 			skip_encoding => 1 # Helps with names with accentuated characters
 		}, "pushing '${title}'");
