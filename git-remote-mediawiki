@@ -691,12 +691,19 @@ sub get_mw_mediafile_for_page_revision {
 	# silently skipped -- this is exactly why description-less / post-upload-edited
 	# files (e.g. the payment-logo icons) cloned with an empty File: page and no
 	# media. iistart alone enumerates newest-first from $timestamp backwards, so
-	# iilimit=1 yields the version in effect at that revision. (Local fork change.)
+	# iilimit=1 yields the version in effect at that revision. iidir=older is the
+	# API default but is set EXPLICITLY so the direction never depends on a default
+	# changing: it guarantees the single returned version is at-or-BEFORE $timestamp
+	# (never a newer upload), and when the file's earliest version is itself newer
+	# than this revision the result is simply empty -- the media backfill
+	# (get_mw_current_mediafile, no timestamp) then fetches the current version.
+	# (Local fork change.)
 	my $query = {
 		action => 'query',
 		prop => 'imageinfo',
 		titles => "File:${filename}",
 		iistart => $timestamp,
+		iidir => 'older',
 		iiprop => 'timestamp|archivename|url',
 		iilimit => 1
 	};
