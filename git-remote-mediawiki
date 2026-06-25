@@ -145,6 +145,16 @@ my $dry_run = (($ENV{GIT_MEDIAWIKI_DRY_RUN} // q{}) =~ /^(?:1|true|yes)$/i) ? 1 
 # LinksUpdate vs SearchUpdate) needs MediaWiki's own profiler, separately.
 my $profile = (($ENV{GIT_MEDIAWIKI_PROFILE} // q{}) =~ /^(?:1|true|yes)$/i) ? 1 : 0;
 my @profile_samples;	# per-edit seconds, collected only when $profile
+#
+# GIT_MEDIAWIKI_PARALLEL_PUSH=N: shard each commit's files across N parallel worker
+# processes (dumbPush ONLY -- last-write-wins, no per-page notes / ordering to keep).
+# Each worker logs in on its OWN handle (a forked LWP/MediaWiki::API handle cannot be
+# shared across processes). This speeds a server-bound bulk load, BUT N concurrent
+# edits reintroduce the LinksUpdate/externallinks contention the dist-encrypted
+# load-guards serialise away -- deadlocks are then absorbed by the per-edit retry, so
+# the net speedup depends on how often they fire. 1 (default) = serial; ignored for a
+# non-dumbPush (incremental) push, which needs serial order for its tracking notes.
+my $parallel_push = (($ENV{GIT_MEDIAWIKI_PARALLEL_PUSH} // q{}) =~ /^([1-9][0-9]*)$/) ? $1 : 1;
 
 my $wiki_login = run_git_quoted(["config", "--get", "remote.${remotename}.mwLogin"]);
 # Note: mwPassword is discouraged. Use the credential system instead.
@@ -2003,26 +2013,64 @@ sub mw_push_revision {
 		# Keep the subject line of the commit message as mediawiki comment for the revision
 		my $commit_msg = run_git_quoted(["log", "--no-walk", '--format="%s"', $sha1_commit]);
 		chomp($commit_msg);
-		# Push every blob
+		# git diff-tree -z gives an output like
+		# <metadata>\0<filename1>\0<metadata>\0<filename2>\0 (split on \0), so
+		# collect the (metadata, filename) pairs for this commit first.
+		my @file_pairs;
 		while (@diff_info_list) {
-			my $status;
-			# git diff-tree -z gives an output like
-			# <metadata>\0<filename1>\0
-			# <metadata>\0<filename2>\0
-			# and we've split on \0.
 			my $info = shift(@diff_info_list);
 			my $file = shift(@diff_info_list);
-			($mw_revision, $status) = mw_push_file($info, $file, $commit_msg, $mw_revision);
-			if ($status eq 'non-fast-forward') {
-				# we may already have sent part of the
-				# commit to MediaWiki, but it's too
-				# late to cancel it. Stop the push in
-				# the middle, but still give an
-				# accurate error message.
-				return error_non_fast_forward($remote);
+			push @file_pairs, [$info, $file];
+		}
+		if ($parallel_push > 1 && $dumb_push && scalar(@file_pairs) > 1) {
+			# Parallel sharded push -- dumbPush only (no per-page notes / ordering to
+			# preserve; each page is an independent last-write-wins edit). Fork up to
+			# $parallel_push workers, round-robin the files; each child RECONNECTS
+			# (connect_maybe(undef,...)) because a forked API/LWP handle is not safe to
+			# share. Children only edit the wiki + write STDERR -- never the git protocol
+			# STDOUT -- so forking the remote helper here is safe. Exit 0=ok, 1=push error.
+			my $workers = $parallel_push < scalar(@file_pairs) ? $parallel_push : scalar(@file_pairs);
+			my @pids;
+			for (my $w = 0; $w < $workers; $w++) {
+				my $pid = fork();
+				if (!defined $pid) {
+					# fork exhaustion: reap the workers already started so they are
+					# not orphaned, then fail the push (a dumbPush re-push is idempotent).
+					waitpid($_, 0) for @pids;
+					die "fork failed: $!\n";
+				}
+				if ($pid == 0) {
+					$mediawiki = connect_maybe(undef, $remotename, $url);
+					for (my $j = $w; $j < scalar(@file_pairs); $j += $workers) {
+						my (undef, $cstatus) = mw_push_file($file_pairs[$j]->[0], $file_pairs[$j]->[1], $commit_msg, $mw_revision);
+						exit 1 if $cstatus ne 'ok';
+					}
+					exit 0;
+				}
+				push @pids, $pid;
 			}
-			if ($status ne 'ok') {
-				die("Unknown error from mw_push_file()\n");
+			my $failed = 0;
+			for my $pid (@pids) {
+				waitpid($pid, 0);
+				$failed = 1 if $? != 0;
+			}
+			# A child failure (non-fast-forward or fatal edit error) fails the push.
+			return error_non_fast_forward($remote) if $failed;
+		} else {
+			# Serial push (default; required for an incremental, notes-tracked push so
+			# $mw_revision advances in order for the tracking note written below).
+			for my $pair (@file_pairs) {
+				my $status;
+				($mw_revision, $status) = mw_push_file($pair->[0], $pair->[1], $commit_msg, $mw_revision);
+				if ($status eq 'non-fast-forward') {
+					# we may already have sent part of the commit to MediaWiki, but
+					# it's too late to cancel it. Stop the push in the middle, but
+					# still give an accurate error message.
+					return error_non_fast_forward($remote);
+				}
+				if ($status ne 'ok') {
+					die("Unknown error from mw_push_file()\n");
+				}
 			}
 		}
 		# In dry-run NOTHING was actually pushed, so do NOT write the durable
