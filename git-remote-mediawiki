@@ -26,6 +26,7 @@ binmode STDERR, ':encoding(UTF-8)';
 binmode STDOUT, ':encoding(UTF-8)';
 
 use URI::Escape;
+use Time::HiRes ();
 
 # It's not always possible to delete pages (may require some
 # privileges). Deleted pages are replaced with this content.
@@ -121,6 +122,29 @@ if ($backfill_media_cfg eq q{}) {
 my $export_media = run_git_quoted(["config", "--get", "--bool", "remote.${remotename}.mediaexport"]);
 chomp($export_media);
 $export_media = !($export_media eq 'false');
+
+# Run-time test/debug toggles. These are deliberately ENV vars (git's own
+# GIT_TRACE-style convention for per-run debug switches) rather than persistent
+# remote.<remote>.* config: they belong to a single test/profiling invocation,
+# not to the remote's saved settings. (Local fork change.)
+#
+# GIT_MEDIAWIKI_DRY_RUN: walk the full push machinery (commit pairs, diffs, file
+# content) but SKIP every wiki-mutating API call -- each page edit / media upload
+# is logged ("DRY-RUN: ...") and treated as a no-op success. Lets the
+# reproduction's stage tests iterate without re-pushing all content every time.
+# It still reports the ref as pushed ("ok") so the stage step succeeds, but writes
+# NO durable mediawiki_revision note / resume checkpoint. (git itself still
+# advances the remote-tracking ref on "ok", so a later run on the SAME clone sees
+# "nothing to push" -- re-clone, as the reproduction does, for a fresh dry-run or
+# a real push.)
+my $dry_run = (($ENV{GIT_MEDIAWIKI_DRY_RUN} // q{}) =~ /^(?:1|true|yes)$/i) ? 1 : 0;
+#
+# GIT_MEDIAWIKI_PROFILE: time each page edit (the API round-trip) and print a
+# per-push summary (count, total, mean, slowest) to stderr -- the CLIENT-side
+# view of where push wall-time goes. The server-side breakdown (parse vs
+# LinksUpdate vs SearchUpdate) needs MediaWiki's own profiler, separately.
+my $profile = (($ENV{GIT_MEDIAWIKI_PROFILE} // q{}) =~ /^(?:1|true|yes)$/i) ? 1 : 0;
+my @profile_samples;	# per-edit seconds, collected only when $profile
 
 my $wiki_login = run_git_quoted(["config", "--get", "remote.${remotename}.mwLogin"]);
 # Note: mwPassword is discouraged. Use the credential system instead.
@@ -1620,6 +1644,10 @@ sub mw_upload_file {
 		# Don't let perl try to interpret file content as UTF-8 => use "raw"
 		my $content = run_git_quoted(["cat-file", "blob", $new_sha1], 'raw');
 		if ($content ne EMPTY) {
+			if ($dry_run) {
+				print {*STDERR} "DRY-RUN: would upload '${complete_file_name}' (" . length($content) . " bytes); skipped.\n";
+				return $newrevid;
+			}
 			$mediawiki = connect_maybe($mediawiki, $remotename, $url);
 			$mediawiki->{config}->{upload_url} =
 				"${url}/index.php/Special:Upload";
@@ -1704,6 +1732,11 @@ sub mw_push_file {
 			$file_content = run_git_quoted(["cat-file", "blob", $new_sha1]);
 		}
 
+		if ($dry_run) {
+			print {*STDERR} "DRY-RUN: would push '${title}' (" . length($file_content) . " bytes); skipped.\n";
+			return ($oldrevid, 'ok');
+		}
+
 		$mediawiki = connect_maybe($mediawiki, $remotename, $url);
 
 		# basetimestamp omitted: it is an edit-conflict guard keyed on the REMOTE
@@ -1719,6 +1752,7 @@ sub mw_push_file {
 		# than aborting the entire push; an auth-class transient there rebuilds
 		# the handle to refresh the CSRF token. A non-transient failure returns
 		# undef with $mediawiki->{error} set, classified below. (Local fork change.)
+		my $edit_t0 = $profile ? Time::HiRes::time() : 0;
 		my $result = mw_api_edit_retry({
 			action => 'edit',
 			summary => $summary,
@@ -1727,6 +1761,11 @@ sub mw_push_file {
 		}, {
 			skip_encoding => 1 # Helps with names with accentuated characters
 		}, "pushing '${title}'");
+		if ($profile && $result) {
+			my $dt = Time::HiRes::time() - $edit_t0;
+			push @profile_samples, $dt;
+			printf {*STDERR} "profile: edit '%s' %.3fs\n", $title, $dt;
+		}
 		if (!$result) {
 			my $err_details = $mediawiki->{error}->{details} || q{};
 			my $err_code = $mediawiki->{error}->{code} // 0;
@@ -1799,6 +1838,15 @@ sub mw_push {
 		print {*STDERR} "\n";
 		print {*STDERR} "  git pull --rebase\n";
 		print {*STDERR} "\n";
+	}
+
+	if ($profile && @profile_samples) {
+		my $n = scalar(@profile_samples);
+		my $total = 0;
+		$total += $_ for @profile_samples;
+		my @sorted = sort { $b <=> $a } @profile_samples;
+		printf {*STDERR} "profile: %d edits, total %.1fs, mean %.3fs, median %.3fs, slowest %.3fs\n",
+			$n, $total, $total / $n, $sorted[int($n / 2)], $sorted[0];
 	}
 	return;
 }
@@ -1971,7 +2019,10 @@ sub mw_push_revision {
 				die("Unknown error from mw_push_file()\n");
 			}
 		}
-		if (!$dumb_push) {
+		# In dry-run NOTHING was actually pushed, so do NOT write the durable
+		# mediawiki_revision tracking note nor advance the resume checkpoint --
+		# that would falsely mark these pages as pushed for a later REAL push.
+		if (!$dumb_push && !$dry_run) {
 			run_git_quoted(["notes", "--ref=${remotename}/mediawiki",
 					"add", "-f", "-m",
 					"mediawiki_revision: ${mw_revision}",
@@ -1979,15 +2030,16 @@ sub mw_push_revision {
 		}
 		# Advance the resume checkpoint: this commit and all its files are now
 		# fully pushed, so an interruption after this point resumes from here.
-		if ($push_resume) {
+		if ($push_resume && !$dry_run) {
 			run_git_quoted(["update-ref", $checkpoint_ref, $sha1_commit]);
 		}
 	}
 
 	# Whole push succeeded -- git advances the remote-tracking ref via the "ok"
 	# below, so the checkpoint is no longer needed; drop it (guarded so a
-	# never-created checkpoint does not error).
-	if ($push_resume) {
+	# never-created checkpoint does not error). Skipped in dry-run, which created
+	# no checkpoint and must not delete a real one left by a prior interrupted push.
+	if ($push_resume && !$dry_run) {
 		my $cp = run_git_quoted(["for-each-ref", "--format=%(objectname)", $checkpoint_ref]);
 		chomp($cp);
 		run_git_quoted(["update-ref", "-d", $checkpoint_ref]) if $cp ne q{};
