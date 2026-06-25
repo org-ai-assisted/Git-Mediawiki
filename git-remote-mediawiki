@@ -1576,6 +1576,19 @@ sub is_auth_transient {
 # so both paths get identical resilience. (Local fork change.)
 sub mw_api_edit_retry {
 	my ($query, $opts, $what) = @_;
+	# MediaWiki::API::_encode_hashref_utf8 runs Encode::_utf8_on() on every scalar
+	# param UNCONDITIONALLY -- even under skip_encoding => 1, which git-mediawiki
+	# sets. On a WIDE-char string (page text / title / summary / delete reason, all
+	# read by _run_git via ':encoding(UTF-8)') that leaves a high-codepoint flagged
+	# string, and modern libwww-perl then aborts the POST with "HTTP::Message
+	# content must be bytes". Pre-encode every scalar param to UTF-8 BYTES at this
+	# single chokepoint (covers edit / upload / delete): _utf8_on on a byte string
+	# only re-flags codepoints 0-255, which stay downgradeable so the POST succeeds.
+	# Array refs (the upload's raw-bytes file spec) are skipped and stay raw.
+	# (Local fork change.)
+	for my $k (keys %{$query}) {
+		$query->{$k} = as_utf8_bytes($query->{$k}) if !ref($query->{$k});
+	}
 	my $attempt = 0;
 	my $backoff = RETRY_BACKOFF_BASE;
 	while (1) {
@@ -1640,8 +1653,8 @@ sub mw_upload_file {
 				"${url}/index.php/Special:Upload";
 			my $uploaded = mw_api_edit_retry({
 				action => 'upload',
-				filename => as_utf8_bytes($complete_file_name),
-				comment => as_utf8_bytes($summary),
+				filename => $complete_file_name,
+				comment => $summary,
 				file => [undef,
 					 as_utf8_bytes($complete_file_name),
 					 Content => $content],
@@ -1736,9 +1749,9 @@ sub mw_push_file {
 		# undef with $mediawiki->{error} set, classified below. (Local fork change.)
 		my $result = mw_api_edit_retry({
 			action => 'edit',
-			summary => as_utf8_bytes($summary),
-			title => as_utf8_bytes($title),
-			text => as_utf8_bytes(mediawiki_clean($file_content, $page_created)),
+			summary => $summary,
+			title => $title,
+			text => mediawiki_clean($file_content, $page_created),
 		}, {
 			skip_encoding => 1 # Helps with names with accentuated characters
 		}, "pushing '${title}'");
