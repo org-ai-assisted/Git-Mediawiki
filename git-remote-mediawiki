@@ -941,10 +941,17 @@ sub mediawiki_clean {
 	# Mediawiki does not allow blank space at the end of a page and ends with a single \n.
 	# This function right trims a string and adds a \n at the end to follow this rule
 	$string =~ s/\s+$//;
-	if ($string eq EMPTY && $page_created) {
-		# Creating empty pages is forbidden.
-		$string = EMPTY_CONTENT;
-	}
+	# The old code substituted EMPTY_CONTENT ("<!-- empty page -->") here when
+	# creating a NEW empty page, on the assumption that "creating empty pages is
+	# forbidden". That is not true for the action=edit API on modern MediaWiki
+	# (verified: it creates a genuinely empty page), and the visible placeholder
+	# LEAKS for any page whose content is consumed as a plain string -- e.g. the
+	# MediaWiki:Aboutsite interface message rendered "<!-- empty page -->" as the
+	# footer's About-link text. Push the empty content unchanged so the wiki page
+	# matches the (empty) source. mediawiki_smudge below still maps any legacy
+	# EMPTY_CONTENT a previously-pushed wiki carries back to empty on import, so
+	# the round-trip stays consistent for wikis written by the old behaviour.
+	# ($page_created is retained in the signature but no longer consulted.)
 	return $string."\n";
 }
 
