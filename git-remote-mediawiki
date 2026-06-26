@@ -1739,11 +1739,22 @@ sub mw_push_file {
 		}
 		my $file_content;
 		if ($page_deleted) {
-			# Deleting a page usually requires
-			# special privileges. A common
-			# convention is to replace the page
-			# with this content instead:
-			$file_content = DELETED_CONTENT;
+			# Deleting a page usually requires special privileges, so the
+			# convention is to overwrite it with a marker instead. DELETED_CONTENT
+			# is WIKITEXT ("[[Category:Deleted]]"); stored into a css / javascript
+			# content-model page (MediaWiki:Foo.css/.js, User:.../*.css|.js) it
+			# renders literally -- dead CSS, or a JS parse error -- which silently
+			# breaks the wiki's combined site assets (the symptom: a MediaWiki:
+			# *.css/.js page whose content is "[[Category:Deleted]]"). Pick a marker
+			# valid for the page's content model, inferred from the title suffix.
+			# (Local fork change.)
+			if ($title =~ /[.]css\z/) {
+				$file_content = "/* page removed via git-mediawiki */\n";
+			} elsif ($title =~ /[.]js\z/) {
+				$file_content = "// page removed via git-mediawiki\n";
+			} else {
+				$file_content = DELETED_CONTENT;
+			}
 		} else {
 			$file_content = run_git_quoted(["cat-file", "blob", $new_sha1]);
 		}
