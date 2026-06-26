@@ -290,6 +290,27 @@ if ($push_resume eq q{}) {
 }
 $push_resume = ($push_resume ne 'false');   # default ON: empty or 'true' enables
 
+# Truly delete removed pages on push instead of overwriting them with a deletion
+# marker. The marker convention (deleted_content_for_title) exists because
+# deleting a page needs privileges most users lack; an UNPRIVILEGED push must
+# keep using it. But a privileged restore (e.g. a sysop bot rebuilding a wiki
+# from a clone) wants a removed page to be GONE (HTTP 404), not left as a visible
+# empty page sitting in [[Category:Deleted]] -- that stale marker page renders as
+# a real, skinned page and diverges from the source wiki. When enabled, the
+# $page_deleted branch in mw_push_file issues action=delete, matching what
+# mw_upload_file already does for files. Default OFF (privilege-safe); set
+# remote.<remotename>.deletePages=true (or mediawiki.deletePages=true) to enable.
+# The import side is unchanged: a deleted page already round-trips as an absent
+# git file ('D'), so deleted -> absent -> action=delete is symmetric. (Local fork
+# change -- faithful privileged restore.)
+my $delete_pages = run_git_quoted(["config", "--get", "--bool", "remote.${remotename}.deletePages"]);
+chomp($delete_pages);
+if ($delete_pages eq q{}) {
+	$delete_pages = run_git_quoted(["config", "--get", "--bool", "mediawiki.deletePages"]);
+	chomp($delete_pages);
+}
+$delete_pages = ($delete_pages eq 'true');   # default OFF: only explicit 'true' enables
+
 my $wiki_name = $url;
 $wiki_name =~ s{[^/]*://}{};
 # If URL is like http://user:password@example.com/, we clearly don't
@@ -1769,6 +1790,49 @@ sub mw_push_file {
 			print {*STDERR} "Ignoring media file related page: ${complete_file_name}\n";
 			return ($oldrevid, 'ok');
 		}
+		# A privileged restore can truly delete a removed page (action=delete),
+		# leaving it GONE rather than as a visible empty marker page. Opt-in via
+		# remote.<remotename>.deletePages; mirrors mw_upload_file's file delete.
+		# (Local fork change.)
+		if ($page_deleted && $delete_pages) {
+			if ($dry_run) {
+				print {*STDERR} "DRY-RUN: would delete page '${title}'; skipped.\n";
+				return ($oldrevid, 'ok');
+			}
+			$mediawiki = connect_maybe($mediawiki, $remotename, $url);
+			my $deleted = mw_api_edit_retry({
+				action => 'delete',
+				title  => $title,
+				reason => $summary,
+			}, undef, "deleting page '${title}'");
+			if (!$deleted) {
+				my $err_details = $mediawiki->{error}->{details} || q{};
+				my $err_code = $mediawiki->{error}->{code} // 0;
+				# Already gone: the page does not exist on the remote (a re-push, or
+				# never created). Nothing to delete -- treat as success, not an abort.
+				if ($err_details =~ /missingtitle|cantdelete/) {
+					print {*STDERR} "Page '${title}' already absent on remote; skipping delete.\n";
+					return ($oldrevid, 'ok');
+				}
+				# Cannot delete this page (no delete right, or it is protected):
+				# fall back to the marker convention rather than aborting the WHOLE
+				# push, so a partially-privileged restore still round-trips the
+				# deletion. Mirrors the protection/permission codes the marker edit
+				# path below treats as skippable -- a page protected against the
+				# marker edit too is then skipped there, leaving it untouched (the
+				# pre-deletePages behaviour). A truly unknown error still dies.
+				if ($err_details =~ /permissiondenied|badaccess|protectedpage|protectednamespace|cascadeprotected|namespaceprotected|protectedtitle/) {
+					print {*STDERR} "Cannot delete '${title}' (${err_details}); falling back to deletion marker.\n";
+				} else {
+					die 'Fatal: Error ' . $err_code .
+						' from mediawiki: ' . $err_details . "\n";
+				}
+			} else {
+				print {*STDERR} "Deleted page: ${title}\n";
+				return ($oldrevid, 'ok');
+			}
+		}
+
 		my $file_content;
 		if ($page_deleted) {
 			# Deleting a page usually requires special privileges, so the convention
