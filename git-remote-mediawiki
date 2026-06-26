@@ -31,6 +31,14 @@ use Time::HiRes ();
 # It's not always possible to delete pages (may require some
 # privileges). Deleted pages are replaced with this content.
 use constant DELETED_CONTENT => "[[Category:Deleted]]\n";
+# A wikitext deletion marker is INVALID in a css/javascript content-model page (it
+# is served as literal css/js and breaks the wiki's combined site assets), so
+# deletions of those pages use a marker valid for the model instead. The push side
+# (deleted_content_for_title) picks one by title suffix; the import side
+# (is_deleted_marker) MUST recognise ANY of them as a deletion -- otherwise a fetch
+# re-imports the marker as ordinary content and resurrects the page. (Local fork change.)
+use constant DELETED_CONTENT_CSS => "/* page removed via git-mediawiki */\n";
+use constant DELETED_CONTENT_JS  => "// page removed via git-mediawiki\n";
 
 # It's not possible to create empty pages. New empty files in Git are
 # sent with this content instead.
@@ -1080,6 +1088,23 @@ sub fe_escape_path {
 	return qq("${path}");
 }
 
+# Push: the deletion marker to write for a removed page, valid for its content
+# model (inferred from the title suffix). Import: whether some content IS one of
+# those markers (a deletion). The two MUST agree. (Local fork change.)
+sub deleted_content_for_title {
+	my $title = shift;
+	return DELETED_CONTENT_CSS if $title =~ /[.]css\z/;
+	return DELETED_CONTENT_JS  if $title =~ /[.]js\z/;
+	return DELETED_CONTENT;
+}
+
+sub is_deleted_marker {
+	my $content = shift;
+	return $content eq DELETED_CONTENT
+		|| $content eq DELETED_CONTENT_CSS
+		|| $content eq DELETED_CONTENT_JS;
+}
+
 sub import_file_revision {
 	my $commit = shift;
 	my %commit = %{$commit};
@@ -1112,7 +1137,7 @@ sub import_file_revision {
 	if (!$full_import && $n == 1) {
 		print {*STDOUT} "from refs/mediawiki/${remotename}/master^0\n";
 	}
-	if ($content ne DELETED_CONTENT) {
+	if (!is_deleted_marker($content)) {
 		print {*STDOUT} 'M 644 inline ' .
 			fe_escape_path("${title}.mw") . "\n";
 		literal_data($content);
@@ -1739,22 +1764,12 @@ sub mw_push_file {
 		}
 		my $file_content;
 		if ($page_deleted) {
-			# Deleting a page usually requires special privileges, so the
-			# convention is to overwrite it with a marker instead. DELETED_CONTENT
-			# is WIKITEXT ("[[Category:Deleted]]"); stored into a css / javascript
-			# content-model page (MediaWiki:Foo.css/.js, User:.../*.css|.js) it
-			# renders literally -- dead CSS, or a JS parse error -- which silently
-			# breaks the wiki's combined site assets (the symptom: a MediaWiki:
-			# *.css/.js page whose content is "[[Category:Deleted]]"). Pick a marker
-			# valid for the page's content model, inferred from the title suffix.
-			# (Local fork change.)
-			if ($title =~ /[.]css\z/) {
-				$file_content = "/* page removed via git-mediawiki */\n";
-			} elsif ($title =~ /[.]js\z/) {
-				$file_content = "// page removed via git-mediawiki\n";
-			} else {
-				$file_content = DELETED_CONTENT;
-			}
+			# Deleting a page usually requires special privileges, so the convention
+			# is to overwrite it with a marker instead -- one valid for the page's
+			# content model (a wikitext marker in a css/js page is served literally
+			# and breaks the site assets). is_deleted_marker() recognises it again on
+			# import so the deletion round-trips. (Local fork change.)
+			$file_content = deleted_content_for_title($title);
 		} else {
 			$file_content = run_git_quoted(["cat-file", "blob", $new_sha1]);
 		}
