@@ -158,10 +158,11 @@ my @profile_samples;	# per-edit seconds, collected only when $profile
 # processes (dumbPush ONLY -- last-write-wins, no per-page notes / ordering to keep).
 # Each worker logs in on its OWN handle (a forked LWP/MediaWiki::API handle cannot be
 # shared across processes). This speeds a server-bound bulk load, BUT N concurrent
-# edits reintroduce the LinksUpdate/externallinks contention the dist-encrypted
-# load-guards serialise away -- deadlocks are then absorbed by the per-edit retry, so
-# the net speedup depends on how often they fire. 1 (default) = serial; ignored for a
-# non-dumbPush (incremental) push, which needs serial order for its tracking notes.
+# edits reintroduce the LinksUpdate/externallinks lock contention that a serialised
+# (one-edit-at-a-time) load avoids -- deadlocks are then absorbed by the per-edit
+# retry, so the net speedup depends on how often they fire. 1 (default) = serial;
+# ignored for a non-dumbPush (incremental) push, which needs serial order for its
+# tracking notes.
 my $parallel_push = (($ENV{GIT_MEDIAWIKI_PARALLEL_PUSH} // q{}) =~ /^([1-9][0-9]*)$/) ? $1 : 1;
 
 my $wiki_login = run_git_quoted(["config", "--get", "remote.${remotename}.mwLogin"]);
@@ -295,8 +296,8 @@ $push_resume = ($push_resume ne 'false');   # default ON: empty or 'true' enable
 # deleting a page needs privileges most users lack; an UNPRIVILEGED push must
 # keep using it. But a privileged restore (e.g. a sysop bot rebuilding a wiki
 # from a clone) wants a removed page to be GONE (HTTP 404), not left as a visible
-# empty page sitting in [[Category:Deleted]] -- that stale marker page renders as
-# a real, skinned page and diverges from the source wiki. When enabled, the
+# empty marker page -- which still renders as a real page and diverges from the
+# source wiki. When enabled, the
 # $page_deleted branch in mw_push_file issues action=delete, matching what
 # mw_upload_file already does for files. Default OFF (privilege-safe); set
 # remote.<remotename>.deletePages=true (or mediawiki.deletePages=true) to enable.
