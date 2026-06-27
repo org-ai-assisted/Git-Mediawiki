@@ -519,9 +519,22 @@ sub get_mw_tracked_namespaces {
 			action => 'query',
 			list => 'allpages',
 			apnamespace => $namespace_id,
-			aplimit => 'max' } )
-			|| die $mediawiki->{error}->{code} . ': '
-			. $mediawiki->{error}->{details} . "\n";
+			aplimit => 'max' } );
+		if (!defined($mw_pages)) {
+			# A tracked namespace may not exist on the remote wiki. When its
+			# id is not a valid namespace there, the API rejects
+			# apnamespace=<id> with a 'badvalue' ("Unrecognized value for
+			# parameter apnamespace") error. Treat that as an empty
+			# namespace -- warn and skip it -- rather than aborting the
+			# whole fetch/push.
+			my $code    = $mediawiki->{error}->{code}    // q{};
+			my $details = $mediawiki->{error}->{details} // q{};
+			if ($details =~ /apnamespace/ && $details =~ /badvalue|Unrecognized[ ]value/i) {
+				print {*STDERR} "warning: skipping tracked namespace $local_namespace ($namespace_id): not present on this wiki ($details)\n";
+				next;
+			}
+			die "$code: $details\n";
+		}
 		print {*STDERR} "$#{$mw_pages} found in namespace $local_namespace ($namespace_id)\n";
 		foreach my $page (@{$mw_pages}) {
 			$pages->{$page->{title}} = $page;
