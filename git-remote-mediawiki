@@ -2023,6 +2023,25 @@ sub mw_push_revision {
 	my $remoteorigin_sha1 = run_git_quoted_nostderr(["rev-parse", "refs/remotes/${remotename}/master"]);
 	chomp($remoteorigin_sha1);
 
+	# Local fork fix (push-tracking drift): refs/remotes/<remote>/master is the
+	# diff base for the push below, but it can lag the AUTHORITATIVE git-mediawiki
+	# tracking ref refs/mediawiki/<remote>/master (the imported HEAD carrying the
+	# latest mediawiki_revision note) -- e.g. a "0 new revisions" fetch advances the
+	# latter but not the former. Diffing against the stale base then replays the gap
+	# as spurious extra-page edits (observed: a 1-file net-delta push emitting 5
+	# unrelated pages). When the tracking ref is strictly ahead of (a descendant of)
+	# the remote-tracking ref, advance the latter to it so the diff base is accurate.
+	# Only ever moves the ref FORWARD to the known-good imported state; on genuine
+	# divergence (not an ancestor) it is left untouched and the non-ff guard applies.
+	my $mw_track_sha1 = run_git_quoted_nostderr(["rev-parse", "--verify", "--quiet", "refs/mediawiki/${remotename}/master"]);
+	chomp($mw_track_sha1);
+	if ($mw_track_sha1 ne q{} && $mw_track_sha1 ne $remoteorigin_sha1
+		&& $remoteorigin_sha1 ne q{}
+		&& git_is_ancestor($remoteorigin_sha1, $mw_track_sha1)) {
+		run_git_quoted(["update-ref", "refs/remotes/${remotename}/master", $mw_track_sha1]);
+		$remoteorigin_sha1 = $mw_track_sha1;
+	}
+
 	# Read any resume checkpoint from a previous interrupted push BEFORE the
 	# non-fast-forward guard below. A checkpoint that is an ancestor of HEAD means
 	# the remote was advanced by OUR OWN interrupted push (whose tracking note did
