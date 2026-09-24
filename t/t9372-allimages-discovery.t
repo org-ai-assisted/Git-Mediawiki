@@ -23,7 +23,7 @@
 
 use strict;
 use warnings;
-use Test::More tests => 11;
+use Test::More tests => 16;
 use FindBin;
 
 my $helper = "$FindBin::Bin/../git-remote-mediawiki";
@@ -32,7 +32,7 @@ my $src = do { local $/; <$fh> };
 close($fh);
 
 my %subs;
-for my $name (qw(get_all_images file_namespace_in_scope fetch_mw_revisions_for_page)) {
+for my $name (qw(get_all_images file_namespace_in_scope fetch_mw_revisions_for_page get_mw_first_pages)) {
 	$src =~ /^sub \Q$name\E \{.*?^\}/ms
 		or die "could not extract sub $name from $helper";
 	$subs{$name} = $&;
@@ -43,6 +43,13 @@ $src =~ /^sub get_mw_pages \{.*?^\}/ms
 	or die "could not extract sub get_mw_pages from $helper";
 like($&, qr/get_all_images/, 'get_mw_pages wires in list=allimages discovery');
 
+# Guard: get_last_remote_revision (runs on every push, iterates the same %pages)
+# must skip a pageid-less synthetic entry rather than query pageids=undef.
+$src =~ /^sub get_last_remote_revision \{.*?^\}/ms
+	or die "could not extract sub get_last_remote_revision from $helper";
+like($&, qr/next if !defined\(\$id\)/,
+	'get_last_remote_revision guards against a pageid-less entry');
+
 my $sandbox = join("\n",
 	'package AllImagesTest;',
 	'use strict; use warnings;',
@@ -51,9 +58,11 @@ my $sandbox = join("\n",
 	'our $shallow_import;',
 	# stub the namespace resolver used by file_namespace_in_scope
 	q{sub get_mw_namespace_id { return { 'File' => 6, 'Template' => 10, 'User' => 2, 'Help' => 12 }->{$_[0]}; }},
+	q{sub fatal_mw_error { die "fatal: @_"; }},
 	$subs{get_all_images},
 	$subs{file_namespace_in_scope},
 	$subs{fetch_mw_revisions_for_page},
+	$subs{get_mw_first_pages},
 	'1;',
 );
 eval $sandbox; ## no critic
@@ -73,7 +82,14 @@ sub quiet (&) {
 package FakeMW;
 sub new { my ($c, %a) = @_; return bless { %a }, $c; }
 sub list { my ($self, $q) = @_; $self->{list_query} = $q; return $self->{list_result}; }
-sub api { die "fetch_mw_revisions_for_page must NOT call the API for a pageid-less entry\n"; }
+sub api {
+	my ($self, $q) = @_;
+	$self->{api_calls}++;
+	# A configured api_result is for get_mw_first_pages; otherwise the caller
+	# (the pageid-less fetch guard) must never reach the API.
+	die "must NOT call the API for a pageid-less entry\n" if !exists $self->{api_result};
+	return $self->{api_result};
+}
 package main;
 
 # ---- get_all_images: discovery + dedup ------------------------------------
@@ -124,4 +140,30 @@ package main;
 			{ title => 'File:Logo-usb-500x500.png' }, undef, 1);
 	};
 	is_deeply(\@revs, [], 'undef pageid returns no revisions without an API call');
+}
+
+# ---- get_mw_first_pages: retain a description-less File: page --------------
+# A negative-pageid "missing" ns-6 result (an upload with no description page)
+# must be kept as a synthetic entry so its binary is backfilled -- even on a
+# narrow clone that never runs get_all_images. A genuinely missing non-File
+# page is still dropped (and warned).
+{
+	$AllImagesTest::mediawiki = FakeMW->new(api_result => { query => { pages => {
+		'-1' => { ns => 6, title => 'File:Orphan.png', missing => q{} },
+		'-2' => { ns => 0, title => 'MissingArticle', missing => q{} },
+		'42' => { ns => 0, title => 'RealPage', pageid => 42 },
+	} } });
+	# A description-less File: already present (e.g. from get_all_images) must
+	# not be clobbered by the retain path.
+	my %pages = ('File:Kept.png' => { title => 'File:Kept.png', marker => 'pre' });
+	# Seed a colliding negative-id row for the dedup check.
+	$AllImagesTest::mediawiki->{api_result}{query}{pages}{'-3'} =
+		{ ns => 6, title => 'File:Kept.png', missing => q{} };
+
+	quiet { AllImagesTest::get_mw_first_pages(['x'], \%pages); };
+
+	ok(exists $pages{'File:Orphan.png'}, 'description-less File: page retained as synthetic entry');
+	ok(!exists $pages{'MissingArticle'}, 'genuinely missing non-File page dropped');
+	is($pages{'RealPage'}{pageid}, 42, 'ordinary existing page added');
+	is($pages{'File:Kept.png'}{marker}, 'pre', 'already-present File: entry not clobbered by retain');
 }

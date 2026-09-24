@@ -583,13 +583,20 @@ sub get_mw_first_pages {
 		if ($id < 0) {
 			# A File: page (ns 6) can exist as an uploaded binary with NO
 			# wikitext description page. The API then reports it "missing"
-			# (negative id), but the file is real and is synced via the
-			# mediaimport / backfill paths regardless of the description.
-			# Emitting "not found on wiki" for these is wrong and was pure
-			# spam on wikis with description-less files, so skip the warning
-			# for the File namespace (genuinely missing non-File pages still
-			# warn).
-			next if defined($page->{ns}) && $page->{ns} == 6;
+			# (negative id), but the file is real. Keep a synthetic title-keyed
+			# entry so the media backfill fetches the binary (it keys only on
+			# the title, and the pageid-less entry is skipped by the
+			# revision-fetch guards). This heals a description-less file LINKED
+			# from a tracked page even on a narrow clone that does not track the
+			# File namespace (where get_all_images does not run). No "not found
+			# on wiki" warning for these -- it was pure spam on wikis with
+			# description-less files; genuinely missing non-File pages still warn.
+			if (defined($page->{ns}) && $page->{ns} == 6) {
+				if (defined($page->{title})) {
+					$pages->{$page->{title}} //= { title => $page->{title} };
+				}
+				next;
+			}
 			print {*STDERR} "Warning: page $page->{title} not found on wiki\n";
 		} else {
 			$pages->{$page->{title}} = $page;
@@ -706,18 +713,17 @@ sub file_namespace_in_scope {
 }
 
 # Enumerate uploaded files via list=allimages. Unlike list=allpages (description
-# pages only) and prop=links|images (whose "missing" negative-pageid results are
-# dropped by get_mw_first_pages), allimages returns a file REGARDLESS of whether
-# it has a File: description page. Without this, a description-less upload
-# referenced from an article -- e.g. kicksecure's Logo-usb-500x500.png on
-# [[Download]] -- never enters %pages, is never imported, and its binary is never
-# backfilled, so the exported wiki links a media file that does not exist.
+# pages only), allimages returns a file REGARDLESS of whether it has a File:
+# description page, so this catches a description-less upload that is NOT linked
+# from any tracked page (get_mw_first_pages already retains the LINKED ones).
+# Without it, such an orphan's binary is never imported/backfilled and any page
+# that later references it (e.g. via a baked /w/images URL) links a media file
+# that does not exist.
 #
-# Insert a synthetic File: entry keyed by title DIRECTLY into %pages (bypassing
-# get_mw_first_pages), so the media backfill (which keys only on the title)
-# fetches the binary. The title-keyed %pages naturally dedups against any
-# description page already discovered; //= preserves that richer entry.
-# (Local fork change.)
+# Insert a synthetic File: entry keyed by title directly into %pages, so the
+# media backfill (which keys only on the title) fetches the binary. The
+# title-keyed %pages naturally dedups against any description page already
+# discovered; //= preserves that richer entry. (Local fork change.)
 sub get_all_images {
 	my $pages = shift;
 	# ->list() auto-follows the aicontinue cursor, so this is fully paginated.
@@ -1006,6 +1012,10 @@ sub get_last_remote_revision {
 
 	foreach my $page (@pages) {
 		my $id = $page->{pageid};
+		# A synthetic list=allimages entry (a description-less upload) has no
+		# pageid and no description revision; skip it rather than querying
+		# pageids=undef (a wasted round-trip plus uninitialized-value warnings).
+		next if !defined($id);
 
 		my $query = {
 			action => 'query',
