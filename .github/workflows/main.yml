@@ -8,25 +8,38 @@ on:
     branches: [master]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   perlcritic:
+    ## CI runs only where we enabled it (org variable). Unset upstream / on a
+    ## fork -> skipped, no runner, run stays green.
+    if: vars.CI_ENABLED_ORG_AI_ASSISTED == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
       - name: Perl critic
-        uses: Difegue/action-perlcritic@master
+        uses: Difegue/action-perlcritic@d7e751eb07c818ee735b2b0cd03c6974bb7d0d5b  # v2.1.0
         env:
           GITHUB_TOKEN: ${{ github.token }}
         with:
           args: --stern ./Git/* ./t/*.pl ./git-*
 
   editorconfig:
+    if: vars.CI_ENABLED_ORG_AI_ASSISTED == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
       - name: Editorconfig
-        uses: zbeekman/EditorConfig-Action@master
+        uses: zbeekman/EditorConfig-Action@ad87de68f3718e100afb65800195b08ea44b7d9e  # v1.1.1
         env:
           GITHUB_TOKEN: ${{ github.token }}
