@@ -752,7 +752,12 @@ sub get_linked_mediafiles {
 	my $pages = shift;
 	my @titles = map { $_->{title} } values(%{$pages});
 
-	my $batch = BATCH_SIZE;
+	# $batch is the LAST index of each slice, so it is BATCH_SIZE - 1: the slice
+	# @titles[0..$batch] is inclusive and must hold BATCH_SIZE titles, not
+	# BATCH_SIZE + 1. Same off-by-one the sibling get_mw_page_list documents
+	# (SLICE_SIZE - 1); an oversized batch risks the API titles-limit rejection
+	# once BATCH_SIZE is raised. (Local fork change.)
+	my $batch = BATCH_SIZE - 1;
 	while (@titles) {
 		if ($#titles < $batch) {
 			$batch = $#titles;
@@ -1551,6 +1556,14 @@ sub mw_import_ref {
 	# with mediaimport=false). These have no new revision so the per-revision
 	# media path above never fetches them. Backfill commits continue from the
 	# tip and reuse fast-import marks above the last import mark ($n).
+	#
+	# Scope note: backfill reads refs/mediawiki/<remote>/master to diff the
+	# imported tree. On a FRESH clone of a small wiki (< checkpointEvery
+	# revisions), no mid-import checkpoint has flushed that ref yet, so a
+	# description-less upload discovered only by get_all_images (no revision to
+	# import) is healed on the NEXT fetch, not the initial clone. Forcing a
+	# synchronous flush here is unsafe -- fast-import "checkpoint" is async with
+	# no ack on this pipe -- so this heal-on-next-fetch behavior is accepted.
 	if ($import_media && $backfill_media) {
 		$n += backfill_missing_mediafiles($n);
 	}

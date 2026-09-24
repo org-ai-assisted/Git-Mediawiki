@@ -23,7 +23,7 @@
 
 use strict;
 use warnings;
-use Test::More tests => 16;
+use Test::More tests => 18;
 use FindBin;
 
 my $helper = "$FindBin::Bin/../git-remote-mediawiki";
@@ -32,7 +32,7 @@ my $src = do { local $/; <$fh> };
 close($fh);
 
 my %subs;
-for my $name (qw(get_all_images file_namespace_in_scope fetch_mw_revisions_for_page get_mw_first_pages)) {
+for my $name (qw(get_all_images file_namespace_in_scope fetch_mw_revisions_for_page get_mw_first_pages get_linked_mediafiles)) {
 	$src =~ /^sub \Q$name\E \{.*?^\}/ms
 		or die "could not extract sub $name from $helper";
 	$subs{$name} = $&;
@@ -57,12 +57,15 @@ my $sandbox = join("\n",
 	'our @tracked_namespaces;',
 	'our $shallow_import;',
 	# stub the namespace resolver used by file_namespace_in_scope
+	'use constant BATCH_SIZE => 10;',
 	q{sub get_mw_namespace_id { return { 'File' => 6, 'Template' => 10, 'User' => 2, 'Help' => 12 }->{$_[0]}; }},
 	q{sub fatal_mw_error { die "fatal: @_"; }},
+	q{sub get_mw_page_list { return; }},
 	$subs{get_all_images},
 	$subs{file_namespace_in_scope},
 	$subs{fetch_mw_revisions_for_page},
 	$subs{get_mw_first_pages},
+	$subs{get_linked_mediafiles},
 	'1;',
 );
 eval $sandbox; ## no critic
@@ -84,9 +87,9 @@ sub new { my ($c, %a) = @_; return bless { %a }, $c; }
 sub list { my ($self, $q) = @_; $self->{list_query} = $q; return $self->{list_result}; }
 sub api {
 	my ($self, $q) = @_;
-	$self->{api_calls}++;
-	# A configured api_result is for get_mw_first_pages; otherwise the caller
-	# (the pageid-less fetch guard) must never reach the API.
+	push @{ $self->{api_log} }, $q;
+	# A configured api_result is for get_mw_first_pages / get_linked_mediafiles;
+	# otherwise the caller (the pageid-less fetch guard) must never reach the API.
 	die "must NOT call the API for a pageid-less entry\n" if !exists $self->{api_result};
 	return $self->{api_result};
 }
@@ -166,4 +169,17 @@ package main;
 	ok(!exists $pages{'MissingArticle'}, 'genuinely missing non-File page dropped');
 	is($pages{'RealPage'}{pageid}, 42, 'ordinary existing page added');
 	is($pages{'File:Kept.png'}{marker}, 'pre', 'already-present File: entry not clobbered by retain');
+}
+
+# ---- get_linked_mediafiles: batches BATCH_SIZE titles, not BATCH_SIZE+1 ----
+# Off-by-one class the sibling get_mw_page_list documents fixing (SLICE_SIZE-1):
+# the inclusive slice must hold BATCH_SIZE (10) titles per API query, not 11.
+{
+	$AllImagesTest::mediawiki = FakeMW->new(api_result => { query => { pages => {} } });
+	my %pages = map { ("P$_" => { title => "P$_" }) } (1 .. 11);
+	quiet { AllImagesTest::get_linked_mediafiles(\%pages); };
+	my @calls = @{ $AllImagesTest::mediawiki->{api_log} };
+	my @first_titles = split /\|/, $calls[0]{titles};
+	is(scalar @first_titles, 10, 'first linked-media batch holds BATCH_SIZE (10) titles');
+	is(scalar @calls, 2, '11 titles split into two batches (10 + 1), not one');
 }
