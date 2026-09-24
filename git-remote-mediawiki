@@ -630,6 +630,13 @@ sub get_mw_pages {
 		} else {
 			get_all_mediafiles(\%pages);
 		}
+		# Also catch uploaded files that have NO description page (list=allpages
+		# and prop=links|images both miss them). Only when the File namespace is
+		# in scope, so a narrow tracked-pages clone is not flooded with every
+		# upload on the wiki. (Local fork change.)
+		if (!$user_defined || file_namespace_in_scope()) {
+			get_all_images(\%pages);
+		}
 	}
 	print {*STDERR} (scalar keys %pages) . " pages found.\n";
 	return %pages;
@@ -680,6 +687,57 @@ sub get_all_mediafiles {
 	}
 	foreach my $page (@{$mw_pages}) {
 		$pages->{$page->{title}} = $page;
+	}
+	return;
+}
+
+# True when the File namespace is part of the tracked scope, so enumerating
+# EVERY uploaded file (incl. description-less ones) via get_all_images matches
+# the user's intent. A clone tracking only specific pages/categories must NOT be
+# flooded with the whole wiki's uploads. (Local fork change.)
+sub file_namespace_in_scope {
+	my $file_id = get_mw_namespace_id('File');
+	return 0 if !defined($file_id);
+	foreach my $ns (@tracked_namespaces) {
+		my $id = ($ns eq '(Main)') ? 0 : get_mw_namespace_id($ns);
+		return 1 if defined($id) && $id == $file_id;
+	}
+	return 0;
+}
+
+# Enumerate uploaded files via list=allimages. Unlike list=allpages (description
+# pages only) and prop=links|images (whose "missing" negative-pageid results are
+# dropped by get_mw_first_pages), allimages returns a file REGARDLESS of whether
+# it has a File: description page. Without this, a description-less upload
+# referenced from an article -- e.g. kicksecure's Logo-usb-500x500.png on
+# [[Download]] -- never enters %pages, is never imported, and its binary is never
+# backfilled, so the exported wiki links a media file that does not exist.
+#
+# Insert a synthetic File: entry keyed by title DIRECTLY into %pages (bypassing
+# get_mw_first_pages), so the media backfill (which keys only on the title)
+# fetches the binary. The title-keyed %pages naturally dedups against any
+# description page already discovered; //= preserves that richer entry.
+# (Local fork change.)
+sub get_all_images {
+	my $pages = shift;
+	# ->list() auto-follows the aicontinue cursor, so this is fully paginated.
+	my $mw_images = $mediawiki->list({
+		action  => 'query',
+		list    => 'allimages',
+		aiprop  => 'timestamp|url',
+		ailimit => 'max',
+	});
+	if (!defined($mw_images)) {
+		# allimages may be disabled/restricted on some wikis. Warn and carry on
+		# rather than aborting the whole fetch -- the other discovery sources
+		# still populate %pages.
+		print {*STDERR} "warning: could not enumerate uploaded files via list=allimages; description-less files may be missing.\n";
+		return;
+	}
+	foreach my $img (@{$mw_images}) {
+		my $title = $img->{title} // ('File:' . ($img->{name} // q{}));
+		next if $title eq q{} || $title eq 'File:';
+		$pages->{$title} //= { title => $title };
 	}
 	return;
 }
@@ -1052,6 +1110,14 @@ sub fetch_mw_revisions_for_page {
 	my $id = shift;
 	my $fetch_from = shift;
 	my @page_revs = ();
+	# A page discovered only via list=allimages (an uploaded file with no
+	# description page) has no pageid and thus no description revisions -- its
+	# binary is fetched by the media backfill. Skip the revision query rather
+	# than sending pageids=undef, which the by_page strategy would otherwise do.
+	# (Local fork change.)
+	if (!defined($id)) {
+		return @page_revs;
+	}
 	my $query = {
 		action => 'query',
 		prop => 'revisions',
