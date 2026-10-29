@@ -21,7 +21,7 @@ BEGIN {
 	@ISA = qw(Exporter);
 
 	# Methods which can be called as standalone functions as well:
-	@EXPORT_OK = qw(clean_filename smudge_filename connect_maybe
+	@EXPORT_OK = qw(clean_filename smudge_filename media_tree_path connect_maybe
 									EMPTY HTTP_CODE_OK HTTP_CODE_PAGE_NOT_FOUND);
 }
 
@@ -87,6 +87,17 @@ sub smudge_filename {
 		$filename = decode_utf8($bytes);
 	}
 	return $filename;
+}
+
+sub media_tree_path {
+	my $title = shift;
+	# MediaWiki File: titles treat space and underscore as equivalent; store the
+	# media blob under the underscore form (as smudge_filename does for the .mw
+	# page path) so the imported tree carries no space-bearing names.
+	$title =~ s/ /_/g;
+	# Defence in depth: never emit a path separator or C0 control byte.
+	$title =~ s{[/\x00-\x1f]}{_}g;
+	return $title;
 }
 
 sub connect_maybe {

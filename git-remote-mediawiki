@@ -17,7 +17,7 @@ use lib (split(/:/, $ENV{GITPERLLIB} || ""));
 
 use MediaWiki::API;
 use Git;
-use Git::Mediawiki qw(clean_filename smudge_filename connect_maybe EMPTY HTTP_CODE_OK);
+use Git::Mediawiki qw(clean_filename smudge_filename media_tree_path connect_maybe EMPTY HTTP_CODE_OK);
 use DateTime::Format::ISO8601;
 use warnings;
 
@@ -1301,12 +1301,6 @@ sub import_file_revision {
 # (import_file_revision) and the backfill presence check MUST use this single
 # definition; if they diverged, the backfill would mis-detect presence and
 # either re-fetch forever or never heal.
-sub media_tree_path {
-	my $title = shift;
-	$title =~ s{[/\x00-\x1f]}{_}g;
-	return $title;
-}
-
 # Backfill File: media whose binary is absent from the imported tree.
 #
 # Runs after the normal import (when remote.<remote>.backfillMedia is on). It
