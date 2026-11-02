@@ -1781,7 +1781,7 @@ sub mw_upload_file {
 	my $newrevid;
 	my $path = "File:${complete_file_name}";
 	my %hashFiles = get_allowed_file_extensions();
-	if (!exists($hashFiles{$extension})) {
+	if (!exists($hashFiles{lc($extension)})) {
 		print {*STDERR} "${complete_file_name} is not a permitted file on this wiki.\n";
 		print {*STDERR} "Check the configuration of file uploads in your mediawiki.\n";
 		return $newrevid;
@@ -2224,7 +2224,7 @@ sub mw_push_revision {
 		# TODO: for now, it's just a delete+add
 		my @diff_info_list = split(/\0/, $diff_infos);
 		# Keep the subject line of the commit message as mediawiki comment for the revision
-		my $commit_msg = run_git_quoted(["log", "--no-walk", '--format="%s"', $sha1_commit]);
+		my $commit_msg = run_git_quoted(["log", "--no-walk", '--format=%s', $sha1_commit]);
 		chomp($commit_msg);
 		# git diff-tree -z gives an output like
 		# <metadata>\0<filename1>\0<metadata>\0<filename2>\0 (split on \0), so
@@ -2334,7 +2334,10 @@ sub get_allowed_file_extensions {
 	};
 	my $result = $mediawiki->api($query);
 	my @file_extensions = map { $_->{ext}} @{$result->{query}->{fileextensions}};
-	%allowed_file_extensions_cache = map { $_ => 1 } @file_extensions;
+	# MediaWiki treats file extensions case-insensitively and siprop=fileextensions
+	# returns them lowercased; normalize both the cache keys and the lookup (see
+	# mw_upload_file) so e.g. a 'Foo.PNG' upload is not silently dropped.
+	%allowed_file_extensions_cache = map { lc($_) => 1 } @file_extensions;
 	$allowed_file_extensions_cached = 1;
 
 	return %allowed_file_extensions_cache;
