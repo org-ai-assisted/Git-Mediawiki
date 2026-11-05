@@ -24,7 +24,7 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Perl critic
         uses: Difegue/action-perlcritic@d7e751eb07c818ee735b2b0cd03c6974bb7d0d5b  # v2.1.0
         env:
@@ -38,7 +38,7 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Editorconfig
         uses: zbeekman/EditorConfig-Action@ad87de68f3718e100afb65800195b08ea44b7d9e  # v1.1.1
         env:
